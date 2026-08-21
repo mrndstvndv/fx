@@ -107,7 +107,11 @@ pub const CommittedFileHandoff = struct {
         after_content: []const u8,
         lifecycle_id: types.ToolLifecycleId,
     ) Allocator.Error!void {
-        const owned_after_content = try alloc.dupe(u8, after_content);
+        const masked_after_content = try mask_for_mutation(alloc, after_content);
+        const owned_after_content = if (masked_after_content.ptr == after_content.ptr)
+            try alloc.dupe(u8, after_content)
+        else
+            @constCast(masked_after_content);
         errdefer alloc.free(owned_after_content);
         const owned_call_id = try alloc.dupe(u8, lifecycle_id.call_id);
         errdefer alloc.free(owned_call_id);
@@ -256,12 +260,14 @@ fn prepareInternal(
             .semantic_failure = preview_too_large_message,
         },
     };
+    const display_before_content = try mask_for_mutation(call_alloc, before_content);
+    const display_after_content = try mask_for_mutation(call_alloc, after_content);
     const preview_result = try buildPreview(
         call_alloc,
         encoded_path,
         preimage,
-        before_content,
-        after_content,
+        display_before_content,
+        display_after_content,
     );
     const preview = switch (preview_result) {
         .preview => |preview| preview,
@@ -269,8 +275,8 @@ fn prepareInternal(
     };
     const review = diff_mod.FileReview.init(
         call_alloc,
-        before_content,
-        after_content,
+        display_before_content,
+        display_after_content,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ArithmeticOverflow => return .{
@@ -1424,6 +1430,15 @@ fn verifyAndReadPreimage(
     } } };
 }
 
+const redacted_placeholder_failure =
+    "edit_file failed: redacted placeholders must be preserved unchanged";
+
+fn mask_for_mutation(alloc: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    return text_utils.maskSecrets(alloc, text) catch |err| switch (err) {
+        error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+    };
+}
+
 fn derivePostimage(
     alloc: Allocator,
     input: file_mutation_contract.FileMutationInput,
@@ -1443,7 +1458,10 @@ fn derivePostimage(
             };
             const occurrence_count = countOccurrences(before, edit.old_string);
             if (occurrence_count == 0) {
-                break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file" };
+                if (!std.mem.containsAtLeast(u8, edit.old_string, 1, text_utils.redaction_placeholder)) {
+                    break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file" };
+                }
+                break :blk try derive_redacted_postimage(alloc, before, edit);
             }
             if (occurrence_count > 1) {
                 break :blk .{ .semantic_failure = try std.fmt.allocPrint(
@@ -1458,30 +1476,273 @@ fn derivePostimage(
                 before,
                 edit.old_string,
             ).?;
-            const prefix_len = match_start;
-            const suffix_start = match_start + edit.old_string.len;
-            var after_len = std.math.add(
-                usize,
-                prefix_len,
-                edit.new_string.len,
-            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
-            after_len = std.math.add(
-                usize,
-                after_len,
-                before.len - suffix_start,
-            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
-            if (after_len > max_content_bytes) {
-                break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
-            }
-
-            const after = try alloc.alloc(u8, after_len);
-            @memcpy(after[0..prefix_len], before[0..prefix_len]);
-            const replacement_end = prefix_len + edit.new_string.len;
-            @memcpy(after[prefix_len..replacement_end], edit.new_string);
-            @memcpy(after[replacement_end..], before[suffix_start..]);
-            break :blk .{ .content = after };
+            break :blk try build_postimage(
+                alloc,
+                before,
+                match_start,
+                match_start + edit.old_string.len,
+                edit.new_string,
+            );
         },
     };
+}
+
+fn derive_redacted_postimage(
+    alloc: Allocator,
+    before: []const u8,
+    edit: file_mutation_contract.EditInput,
+) error{OutOfMemory}!PostimageResult {
+    var projection = try text_utils.redact_with_spans(alloc, before);
+    defer projection.deinit(alloc);
+
+    const occurrence_count = countOccurrences(projection.bytes, edit.old_string);
+    if (occurrence_count == 0) {
+        return .{ .semantic_failure = "edit_file failed: old_string not found in file" };
+    }
+    if (occurrence_count > 1) {
+        return .{ .semantic_failure = try std.fmt.allocPrint(
+            alloc,
+            "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
+            .{occurrence_count},
+        ) };
+    }
+
+    const match_start = std.mem.find(u8, projection.bytes, edit.old_string).?;
+    const match_end = match_start + edit.old_string.len;
+    const raw_start = raw_boundary_for_visible_offset(projection, match_start) orelse
+        return .{ .semantic_failure = redacted_placeholder_failure };
+    const raw_end = raw_boundary_for_visible_offset(projection, match_end) orelse
+        return .{ .semantic_failure = redacted_placeholder_failure };
+
+    const old_placeholder_count = countOccurrences(
+        edit.old_string,
+        text_utils.redaction_placeholder,
+    );
+    const new_placeholder_count = countOccurrences(
+        edit.new_string,
+        text_utils.redaction_placeholder,
+    );
+    if (old_placeholder_count != new_placeholder_count) {
+        return .{ .semantic_failure = redacted_placeholder_failure };
+    }
+
+    var hidden_spans: std.ArrayList(text_utils.RedactedSpan) = .empty;
+    defer hidden_spans.deinit(alloc);
+    const first_placeholder_ordinal = countOccurrences(
+        projection.bytes[0..match_start],
+        text_utils.redaction_placeholder,
+    );
+    for (projection.spans) |span| {
+        if (span.visible_end <= match_start) continue;
+        if (span.visible_start >= match_end) break;
+        if (span.visible_start < match_start or span.visible_end > match_end) {
+            return .{ .semantic_failure = redacted_placeholder_failure };
+        }
+        try hidden_spans.append(alloc, .{
+            .placeholder_ordinal = span.placeholder_ordinal - first_placeholder_ordinal,
+            .raw_start = span.raw_start,
+            .raw_end = span.raw_end,
+            .visible_start = span.visible_start,
+            .visible_end = span.visible_end,
+        });
+    }
+
+    var replacement_list: std.ArrayList(u8) = .empty;
+    defer replacement_list.deinit(alloc);
+    var replacement_start: usize = 0;
+    var new_ordinal: usize = 0;
+    var hidden_index: usize = 0;
+    while (std.mem.find(u8, edit.new_string[replacement_start..], text_utils.redaction_placeholder)) |relative| {
+        const placeholder_start = replacement_start + relative;
+        try replacement_list.appendSlice(alloc, edit.new_string[replacement_start..placeholder_start]);
+        if (hidden_index < hidden_spans.items.len and
+            hidden_spans.items[hidden_index].placeholder_ordinal == new_ordinal)
+        {
+            const span = hidden_spans.items[hidden_index];
+            try replacement_list.appendSlice(alloc, before[span.raw_start..span.raw_end]);
+            hidden_index += 1;
+        } else {
+            try replacement_list.appendSlice(alloc, text_utils.redaction_placeholder);
+        }
+        new_ordinal += 1;
+        replacement_start = placeholder_start + text_utils.redaction_placeholder.len;
+    }
+    try replacement_list.appendSlice(alloc, edit.new_string[replacement_start..]);
+    if (hidden_index != hidden_spans.items.len) {
+        return .{ .semantic_failure = redacted_placeholder_failure };
+    }
+    for (hidden_spans.items) |hidden| {
+        if (redacted_placeholder_retargeted(
+            edit.old_string,
+            edit.new_string,
+            hidden.placeholder_ordinal,
+        )) {
+            return .{ .semantic_failure = redacted_placeholder_failure };
+        }
+    }
+
+    const replacement = try replacement_list.toOwnedSlice(alloc);
+    defer alloc.free(replacement);
+    return build_postimage(alloc, before, raw_start, raw_end, replacement);
+}
+
+fn build_postimage(
+    alloc: Allocator,
+    before: []const u8,
+    match_start: usize,
+    match_end: usize,
+    replacement: []const u8,
+) error{OutOfMemory}!PostimageResult {
+    var after_len = std.math.add(usize, match_start, replacement.len) catch
+        return .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
+    after_len = std.math.add(usize, after_len, before.len - match_end) catch
+        return .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
+    if (after_len > max_content_bytes) {
+        return .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
+    }
+
+    const after = try alloc.alloc(u8, after_len);
+    @memcpy(after[0..match_start], before[0..match_start]);
+    const replacement_end = match_start + replacement.len;
+    @memcpy(after[match_start..replacement_end], replacement);
+    @memcpy(after[replacement_end..], before[match_end..]);
+    return .{ .content = after };
+}
+
+/// Ordinal is the hidden-span identity. Visible edits may shift its byte
+/// offset, but an assignment label change would retarget the raw span.
+fn redacted_placeholder_retargeted(
+    old_string: []const u8,
+    new_string: []const u8,
+    placeholder_ordinal: usize,
+) bool {
+    if (field_label_for_placeholder(old_string, placeholder_ordinal)) |old_label| {
+        const new_label = field_label_for_placeholder(new_string, placeholder_ordinal) orelse return true;
+        return !std.mem.eql(u8, old_label, new_label);
+    }
+    if (field_label_for_placeholder(new_string, placeholder_ordinal) != null) return true;
+    return unlabelled_placeholder_moved(old_string, new_string, placeholder_ordinal);
+}
+
+fn unlabelled_placeholder_moved(
+    old_string: []const u8,
+    new_string: []const u8,
+    placeholder_ordinal: usize,
+) bool {
+    const old_start = placeholder_start_for_ordinal(old_string, placeholder_ordinal) orelse return true;
+    const new_start = placeholder_start_for_ordinal(new_string, placeholder_ordinal) orelse return true;
+    if (line_ordinal(old_string, old_start) != line_ordinal(new_string, new_start)) return true;
+
+    const old_end = old_start + text_utils.redaction_placeholder.len;
+    const before_anchor = nearest_anchor_before(old_string, old_start) orelse return true;
+    const after_anchor = nearest_anchor_after(old_string, old_end) orelse return true;
+    if (!contains_anchor_before(new_string, new_start, before_anchor)) return true;
+    if (!contains_anchor_after(new_string, new_start + text_utils.redaction_placeholder.len, after_anchor)) return true;
+    return false;
+}
+
+fn nearest_anchor_before(text: []const u8, end: usize) ?[]const u8 {
+    const line_start = line_start_for_offset(text, end);
+    var token_end = end;
+    while (token_end > line_start and std.ascii.isWhitespace(text[token_end - 1])) : (token_end -= 1) {}
+    var token_start = token_end;
+    while (token_start > line_start and !std.ascii.isWhitespace(text[token_start - 1])) : (token_start -= 1) {}
+    if (token_start == token_end) return null;
+    return text[token_start..token_end];
+}
+
+fn nearest_anchor_after(text: []const u8, start: usize) ?[]const u8 {
+    const line_end = std.mem.findScalarPos(u8, text, start, '\n') orelse text.len;
+    var token_start = start;
+    while (token_start < line_end and std.ascii.isWhitespace(text[token_start])) : (token_start += 1) {}
+    var token_end = token_start;
+    while (token_end < line_end and !std.ascii.isWhitespace(text[token_end])) : (token_end += 1) {}
+    if (token_start == token_end) return null;
+    return text[token_start..token_end];
+}
+
+fn contains_anchor_before(text: []const u8, end: usize, anchor: []const u8) bool {
+    const line_start = line_start_for_offset(text, end);
+    return contains_bounded_anchor(text[line_start..end], anchor);
+}
+
+fn contains_anchor_after(text: []const u8, start: usize, anchor: []const u8) bool {
+    const line_end = std.mem.findScalarPos(u8, text, start, '\n') orelse text.len;
+    return contains_bounded_anchor(text[start..line_end], anchor);
+}
+
+fn contains_bounded_anchor(text: []const u8, anchor: []const u8) bool {
+    var search_start: usize = 0;
+    while (std.mem.find(u8, text[search_start..], anchor)) |relative| {
+        const start = search_start + relative;
+        const end = start + anchor.len;
+        const left_bounded = start == 0 or std.ascii.isWhitespace(text[start - 1]);
+        const right_bounded = end == text.len or std.ascii.isWhitespace(text[end]);
+        if (left_bounded and right_bounded) return true;
+        search_start = start + 1;
+    }
+    return false;
+}
+
+fn line_start_for_offset(text: []const u8, offset: usize) usize {
+    var start = @min(offset, text.len);
+    while (start > 0 and text[start - 1] != '\n') : (start -= 1) {}
+    return start;
+}
+
+fn line_ordinal(text: []const u8, offset: usize) usize {
+    return std.mem.count(u8, text[0..@min(offset, text.len)], "\n");
+}
+
+fn field_label_for_placeholder(text: []const u8, placeholder_ordinal: usize) ?[]const u8 {
+    const marker_start = placeholder_start_for_ordinal(text, placeholder_ordinal) orelse return null;
+    var line_start = marker_start;
+    while (line_start > 0 and text[line_start - 1] != '\n') : (line_start -= 1) {}
+
+    var delimiter: ?usize = null;
+    for (text[line_start..marker_start], line_start..) |byte, index| {
+        if (byte == '=' or byte == ':') delimiter = index;
+    }
+    const delimiter_index = delimiter orelse return null;
+    var label_end = delimiter_index;
+    while (label_end > line_start and std.ascii.isWhitespace(text[label_end - 1])) : (label_end -= 1) {}
+    var label_start = label_end;
+    while (label_start > line_start and
+        (std.ascii.isAlphanumeric(text[label_start - 1]) or text[label_start - 1] == '_')) : (label_start -= 1)
+    {}
+    if (label_start == label_end) return null;
+    return text[label_start..label_end];
+}
+
+fn placeholder_start_for_ordinal(text: []const u8, target_ordinal: usize) ?usize {
+    var search_start: usize = 0;
+    var ordinal: usize = 0;
+    while (std.mem.find(u8, text[search_start..], text_utils.redaction_placeholder)) |relative| {
+        const marker_start = search_start + relative;
+        if (ordinal == target_ordinal) return marker_start;
+        search_start = marker_start + text_utils.redaction_placeholder.len;
+        ordinal += 1;
+    }
+    return null;
+}
+
+fn raw_boundary_for_visible_offset(
+    projection: text_utils.RedactedProjection,
+    visible_offset: usize,
+) ?usize {
+    if (visible_offset > projection.bytes.len) return null;
+
+    var visible_cursor: usize = 0;
+    var raw_cursor: usize = 0;
+    for (projection.spans) |span| {
+        if (visible_offset <= span.visible_start) {
+            return raw_cursor + visible_offset - visible_cursor;
+        }
+        if (visible_offset < span.visible_end) return null;
+        visible_cursor = span.visible_end;
+        raw_cursor = span.raw_end;
+    }
+    return raw_cursor + visible_offset - visible_cursor;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -1706,6 +1967,46 @@ fn expectSemanticFailure(
     };
 }
 
+fn expect_redacted_after(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    id: []const u8,
+    path: []const u8,
+    old_string: []const u8,
+    new_string: []const u8,
+    expected: []const u8,
+) !PreparedFileMutation {
+    const call: types.ToolCall = .{
+        .id = id,
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(alloc, path, old_string, new_string),
+    };
+    const policy = try evaluatePolicy(alloc, workspace_root, call);
+    const prepared = try expectPrepared(alloc, call, policy);
+    try std.testing.expectEqualStrings(expected, prepared.after_content);
+    return prepared;
+}
+
+fn expect_redacted_failure(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    id: []const u8,
+    path: []const u8,
+    old_string: []const u8,
+    new_string: []const u8,
+) !void {
+    const call: types.ToolCall = .{
+        .id = id,
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(alloc, path, old_string, new_string),
+    };
+    const policy = try evaluatePolicy(alloc, workspace_root, call);
+    try std.testing.expectEqualStrings(
+        redacted_placeholder_failure,
+        try expectSemanticFailure(alloc, call, policy),
+    );
+}
+
 fn decodeTestMutationInput(
     alloc: Allocator,
     call: types.ToolCall,
@@ -1924,6 +2225,249 @@ test "prepare computes one exact edit occurrence" {
     try std.testing.expectEqualStrings("alpha\nBETA\ngamma\n", prepared.after_content);
     try std.testing.expectEqual(@as(usize, 1), prepared.preview.additions);
     try std.testing.expectEqual(@as(usize, 1), prepared.preview.deletions);
+}
+
+test "prepare maps redacted edits without exposing or changing secrets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "surrounding.txt", "before API_KEY=super-secret after\n");
+    try createFile(&tmp, "same-line.txt", "const API_KEY=\"super-secret\";\n");
+    try createFile(&tmp, "literal.txt", "literal [redacted] value\n");
+    try createFile(&tmp, "mixed.txt", "literal [redacted] API_KEY=only-secret end\n");
+    try createFile(&tmp, "inline.txt", "left sk-abcdefghijklmnop right\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+
+    const surrounding_call: types.ToolCall = .{
+        .id = "edit-redacted-surrounding",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(
+            arena,
+            "surrounding.txt",
+            "before API_KEY=[redacted] after",
+            "before API_KEY=[redacted] changed after",
+        ),
+    };
+    const surrounding_policy = try evaluatePolicy(arena, root, surrounding_call);
+    const surrounding = try expectPrepared(arena, surrounding_call, surrounding_policy);
+    try std.testing.expectEqualStrings(
+        "before API_KEY=super-secret changed after\n",
+        surrounding.after_content,
+    );
+    try std.testing.expect(std.mem.find(u8, surrounding.after_content, "[redacted]") == null);
+    for (surrounding.preview.lines) |line| {
+        try std.testing.expect(std.mem.find(u8, line.text, "super-secret") == null);
+    }
+    var review_view = try surrounding.review.viewport(arena, 0, surrounding.review.rowCount());
+    defer review_view.deinit(arena);
+    for (review_view.lines) |line| {
+        try std.testing.expect(std.mem.find(u8, line.text, "super-secret") == null);
+    }
+
+    const stale_prepared = try prepareForApply(arena, root, surrounding_call);
+    const applied = try prepareForApply(arena, root, surrounding_call);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const applied_result = try apply(
+        arena,
+        arena,
+        surrounding_call,
+        executionAuthorization(applied),
+        &cancel_flag,
+    );
+    var applied_handoff = switch (applied_result) {
+        .committed => |handoff| handoff,
+        .rejected => return error.UnexpectedRejectedMutation,
+    };
+    for (applied_handoff.preview.lines) |line| {
+        try std.testing.expect(std.mem.find(u8, line.text, "super-secret") == null);
+    }
+    try std.testing.expect(std.mem.find(
+        u8,
+        applied_handoff.tracker.previous_content.?,
+        "super-secret",
+    ) != null);
+    applied_handoff.attachFullView(arena, applied.prepared.after_content, .{
+        .turn_id = 1,
+        .call_id = "redacted-full-view",
+    }) catch return error.UnexpectedFullView;
+    try std.testing.expect(std.mem.find(
+        u8,
+        applied_handoff.full_view.?.after_content,
+        "super-secret",
+    ) == null);
+    const installed = try readTestFile(arena, &tmp, "surrounding.txt");
+    try std.testing.expectEqualStrings(
+        "before API_KEY=super-secret changed after\n",
+        installed,
+    );
+    {
+        var file = try tmp.dir.openFile(std.testing.io, "surrounding.txt", .{ .mode = .write_only });
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, 0);
+        try file.writeStreamingAll(std.testing.io, "raced");
+    }
+    _ = try expectApplyRejected(
+        try apply(
+            arena,
+            arena,
+            surrounding_call,
+            executionAuthorization(stale_prepared),
+            &cancel_flag,
+        ),
+        .stale_preimage,
+    );
+
+    _ = try expect_redacted_after(
+        arena,
+        root,
+        "edit-redacted-same-line",
+        "same-line.txt",
+        "const API_KEY=\"[redacted]\";",
+        "const updated API_KEY=\"[redacted]\"; // changed",
+        "const updated API_KEY=\"super-secret\"; // changed\n",
+    );
+    _ = try expect_redacted_after(
+        arena,
+        root,
+        "edit-mixed-placeholder",
+        "mixed.txt",
+        "literal [redacted] API_KEY=[redacted] end",
+        "literal [redacted] API_KEY=[redacted] changed end",
+        "literal [redacted] API_KEY=only-secret changed end\n",
+    );
+    _ = try expect_redacted_after(
+        arena,
+        root,
+        "edit-literal-placeholder",
+        "literal.txt",
+        "literal [redacted] value",
+        "literal marker value",
+        "literal marker value\n",
+    );
+
+    const inline_prepared = try expect_redacted_after(
+        arena,
+        root,
+        "edit-inline-secret",
+        "inline.txt",
+        "left [redacted] right",
+        "added left [redacted] right changed",
+        "added left sk-abcdefghijklmnop right changed\n",
+    );
+    for (inline_prepared.preview.lines) |line| {
+        try std.testing.expect(std.mem.find(u8, line.text, "sk-abcdefghijklmnop") == null);
+    }
+    var inline_review = try inline_prepared.review.viewport(arena, 0, inline_prepared.review.rowCount());
+    defer inline_review.deinit(arena);
+    for (inline_review.lines) |line| {
+        try std.testing.expect(std.mem.find(u8, line.text, "sk-abcdefghijklmnop") == null);
+    }
+    var inline_handoff = CommittedFileHandoff.init(inline_prepared.preview, .{
+        .kind = .edit,
+        .raw_path = "/tmp/inline.txt",
+        .previous_content = inline_prepared.preimage.present.content,
+        .committed_at_ms = 0,
+    });
+    inline_handoff.attachFullView(arena, inline_prepared.after_content, .{
+        .turn_id = 2,
+        .call_id = "inline-full-view",
+    }) catch return error.UnexpectedFullView;
+    try std.testing.expect(std.mem.find(
+        u8,
+        inline_handoff.full_view.?.after_content,
+        "sk-abcdefghijklmnop",
+    ) == null);
+}
+
+test "prepare rejects ambiguous and manipulated redacted edits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "ambiguous.txt", "API_KEY=first-secret\nAPI_KEY=second-secret\n");
+    try createFile(&tmp, "single.txt", "left API_KEY=only-secret right\n");
+    try createFile(&tmp, "reordered.txt", "first API_KEY=first-secret second TOKEN=second-secret end\n");
+    try createFile(&tmp, "inline-move.txt", "left sk-abcdefghijklmnop right\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+
+    const ambiguous_call: types.ToolCall = .{
+        .id = "edit-redacted-ambiguous",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(
+            arena,
+            "ambiguous.txt",
+            "API_KEY=[redacted]",
+            "API_KEY=[redacted] changed",
+        ),
+    };
+    const ambiguous_policy = try evaluatePolicy(arena, root, ambiguous_call);
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences), provide more context",
+        try expectSemanticFailure(arena, ambiguous_call, ambiguous_policy),
+    );
+
+    const reordered_call: types.ToolCall = .{
+        .id = "reorder",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(
+            arena,
+            "reordered.txt",
+            "first API_KEY=[redacted] second TOKEN=[redacted] end",
+            "second TOKEN=[redacted] first API_KEY=[redacted] end",
+        ),
+    };
+    const reordered_policy = try evaluatePolicy(arena, root, reordered_call);
+    try std.testing.expectEqualStrings(
+        redacted_placeholder_failure,
+        try expectSemanticFailure(arena, reordered_call, reordered_policy),
+    );
+
+    const cases = [_]struct {
+        id: []const u8,
+        new_string: []const u8,
+    }{
+        .{ .id = "delete", .new_string = "left right" },
+        .{ .id = "duplicate", .new_string = "left API_KEY=[redacted] and [redacted] right" },
+        .{ .id = "alter", .new_string = "left API_KEY=[redactedx] right" },
+        .{ .id = "retarget", .new_string = "left PASSWORD=[redacted] right" },
+    };
+    for (cases) |case| {
+        try expect_redacted_failure(
+            arena,
+            root,
+            case.id,
+            "single.txt",
+            "left API_KEY=[redacted] right",
+            case.new_string,
+        );
+    }
+    try expect_redacted_failure(
+        arena,
+        root,
+        "inline-move-across-anchor",
+        "inline-move.txt",
+        "left [redacted] right",
+        "left right [redacted]",
+    );
+    try expect_redacted_failure(
+        arena,
+        root,
+        "inline-move-line",
+        "inline-move.txt",
+        "left [redacted] right",
+        "left\nright [redacted]",
+    );
+    try expect_redacted_failure(
+        arena,
+        root,
+        "inline-move-field",
+        "inline-move.txt",
+        "left [redacted] right",
+        "API_KEY=[redacted]",
+    );
 }
 
 test "prepare preserves exact edit semantic failures" {

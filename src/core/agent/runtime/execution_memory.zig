@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const types = @import("../../shared/types.zig");
+const diff_mod = @import("../../output/diff.zig");
 const execution_memory_helpers = @import("../execution_memory.zig");
 const result_store = @import("../../session/result_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
@@ -364,7 +365,7 @@ pub fn captureCommittedFilePresentation(
     alloc: Allocator,
     handoff: file_mutation.CommittedFileHandoff,
 ) !types.CommittedFilePresentation {
-    const path = try alloc.dupe(u8, handoff.preview.path);
+    const path = try execution_memory_helpers.redactText(alloc, handoff.preview.path);
     errdefer alloc.free(path);
     const lines = try alloc.alloc(types.CommittedFilePresentationLine, handoff.preview.lines.len);
     errdefer alloc.free(lines);
@@ -383,18 +384,18 @@ pub fn captureCommittedFilePresentation(
             },
             .old_line = line.old_line,
             .new_line = line.new_line,
-            .text = try alloc.dupe(u8, line.text),
+            .text = try execution_memory_helpers.redactText(alloc, line.text),
         };
         copied_lines += 1;
     }
     const full_view = handoff.full_view;
     const previous_content = if (full_view != null) if (handoff.tracker.previous_content) |content|
-        try alloc.dupe(u8, content)
+        try execution_memory_helpers.redactText(alloc, content)
     else
         null else null;
     errdefer if (previous_content) |content| alloc.free(content);
     const after_content = if (full_view) |full|
-        try alloc.dupe(u8, full.after_content)
+        try execution_memory_helpers.redactText(alloc, full.after_content)
     else
         null;
     errdefer if (after_content) |content| alloc.free(content);
@@ -649,6 +650,39 @@ test "exact command sources delete replay and missing handles retain it" {
     var after_missing = try capability.iterate(alloc, .command_artifacts);
     defer after_missing.deinit();
     try std.testing.expectEqual(transform_cases.len + 1, after_missing.names.len);
+}
+
+test "current-turn committed file presentation redacts raw handoff content" {
+    const alloc = std.testing.allocator;
+    const hidden = "API_KEY=distinctive-hidden-value";
+    const preview_lines = [_]diff_mod.PreviewLine{
+        .{ .op = .addition, .new_line = 1, .text = hidden },
+    };
+    var handoff = file_mutation.CommittedFileHandoff.init(
+        .{
+            .path = "note.txt",
+            .lines = &preview_lines,
+            .additions = 1,
+            .deletions = 0,
+            .truncated = false,
+        },
+        .{
+            .kind = .edit,
+            .raw_path = "/tmp/note.txt",
+            .previous_content = hidden,
+            .committed_at_ms = 0,
+        },
+    );
+    handoff.full_view = .{
+        .after_content = hidden,
+        .lifecycle_id = .{ .turn_id = 1, .call_id = "call" },
+    };
+
+    const presentation = try captureCommittedFilePresentation(alloc, handoff);
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+    try std.testing.expect(std.mem.find(u8, presentation.lines[0].text, hidden) == null);
+    try std.testing.expect(std.mem.find(u8, presentation.previous_content.?, hidden) == null);
+    try std.testing.expect(std.mem.find(u8, presentation.after_content.?, hidden) == null);
 }
 
 test "common execution memory does not mark stored read previews as full" {

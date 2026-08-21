@@ -427,25 +427,92 @@ pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8
     return std.fmt.allocPrint(arena, "binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
 }
 
-pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    defer out.deinit();
-    var modified = false;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (findSecretSpan(text, i)) |span| {
-            modified = true;
-            try out.writer.writeAll(text[i..span.prefix_end]);
-            try out.writer.writeAll("[redacted]");
+pub const redaction_placeholder = "[redacted]";
+
+pub const RedactedSpan = struct {
+    visible_start: usize,
+    visible_end: usize,
+    raw_start: usize,
+    raw_end: usize,
+    placeholder_ordinal: usize,
+};
+
+pub const RedactedProjection = struct {
+    bytes: []u8,
+    spans: []RedactedSpan,
+
+    pub fn deinit(self: *RedactedProjection, alloc: std.mem.Allocator) void {
+        alloc.free(self.bytes);
+        alloc.free(self.spans);
+        self.* = undefined;
+    }
+};
+
+/// Builds the model-visible secret projection and records only offsets for
+/// redacted spans. The recorded offsets let trusted mutation code preserve raw
+/// bytes without making them part of model-facing data.
+pub fn redact_with_spans(alloc: std.mem.Allocator, text: []const u8) !RedactedProjection {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(alloc);
+    var spans: std.ArrayList(RedactedSpan) = .empty;
+    errdefer spans.deinit(alloc);
+
+    var raw_index: usize = 0;
+    while (raw_index < text.len) {
+        if (findSecretSpan(text, raw_index)) |span| {
+            try bytes.appendSlice(alloc, text[raw_index..span.prefix_end]);
+            const visible_start = bytes.items.len;
+            try bytes.appendSlice(alloc, redaction_placeholder);
+            try spans.append(alloc, .{
+                .visible_start = visible_start,
+                .visible_end = bytes.items.len,
+                .raw_start = span.prefix_end,
+                .raw_end = span.prefix_end + span.value_len,
+                .placeholder_ordinal = 0,
+            });
             debug_trace.logf("core", "model-facing secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
-            i = span.prefix_end + span.value_len;
+            raw_index = span.prefix_end + span.value_len;
         } else {
-            try out.writer.writeByte(text[i]);
-            i += 1;
+            try bytes.append(alloc, text[raw_index]);
+            raw_index += 1;
         }
     }
-    if (!modified) return text;
-    return try out.toOwnedSlice();
+
+    var span_index: usize = 0;
+    var placeholder_ordinal: usize = 0;
+    var search_start: usize = 0;
+    while (std.mem.find(u8, bytes.items[search_start..], redaction_placeholder)) |relative| {
+        const marker_start = search_start + relative;
+        if (span_index < spans.items.len and spans.items[span_index].visible_start == marker_start) {
+            spans.items[span_index].placeholder_ordinal = placeholder_ordinal;
+            span_index += 1;
+        }
+        placeholder_ordinal += 1;
+        search_start = marker_start + redaction_placeholder.len;
+    }
+
+    const owned_bytes = try bytes.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_bytes);
+    return .{
+        .bytes = owned_bytes,
+        .spans = try spans.toOwnedSlice(alloc),
+    };
+}
+
+pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) error{ OutOfMemory, WriteFailed }![]const u8 {
+    var scan_index: usize = 0;
+    while (scan_index < text.len) : (scan_index += 1) {
+        if (findSecretSpan(text, scan_index) != null) break;
+    }
+    if (scan_index == text.len) return text;
+
+    var projection = try redact_with_spans(arena, text);
+    if (projection.spans.len == 0) {
+        projection.deinit(arena);
+        return text;
+    }
+    arena.free(projection.spans);
+    return projection.bytes;
 }
 
 pub fn redactUrlForDisplay(alloc: std.mem.Allocator, raw_url: []const u8) error{OutOfMemory}![]u8 {

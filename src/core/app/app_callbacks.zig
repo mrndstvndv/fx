@@ -21,6 +21,7 @@ const command_output_content = @import("../tooling/command_output_content.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_usage = @import("../session/session_usage.zig");
@@ -58,11 +59,23 @@ fn preparedDiffPayloadWithFullAllocator(
     full_alloc: Allocator,
     handoff: file_mutation.CommittedFileHandoff,
 ) !diff_mod.DiffEntryPayload {
+    var safe_previous_content: ?[]const u8 = null;
+    if (handoff.tracker.previous_content) |content| {
+        safe_previous_content = try text_utils.maskSecrets(alloc, content);
+    }
+    defer if (safe_previous_content) |content| {
+        if (handoff.tracker.previous_content == null or
+            content.ptr != handoff.tracker.previous_content.?.ptr)
+        {
+            alloc.free(@constCast(content));
+        }
+    };
+
     return diff_mod.formatFileChangePayload(
         alloc,
         full_alloc,
         handoff.preview,
-        handoff.tracker.previous_content,
+        safe_previous_content,
         if (handoff.full_view) |snapshot| .{
             .after_content = snapshot.after_content,
             .lifecycle_id = snapshot.lifecycle_id,

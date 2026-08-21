@@ -346,6 +346,7 @@ fn subagentActionFromDecoded(action: input_action.Action) ?subagent_input.Action
         .toggle_full_transcript,
         .toggle_permission_mode,
         .open_all_sessions,
+        .open_model_catalog,
         .paste_start,
         .paste_end,
         .ignore,

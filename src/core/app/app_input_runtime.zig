@@ -1115,6 +1115,9 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     }
                 },
+                .open_model_catalog => {
+                    try completion_rt.openCurrentModelPicker(app);
+                },
                 .paste_start => dismissActiveMenusThenRedraw(app),
                 .paste_end => {},
                 .remapped_byte => unreachable,
