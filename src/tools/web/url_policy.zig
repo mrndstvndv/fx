@@ -540,6 +540,11 @@ fn ipv4InCidr(bytes: [4]u8, prefix: [4]u8, bits: u6) bool {
 }
 
 fn isPublicIpv6(bytes: [16]u8) bool {
+    const well_known_nat64_prefix = [_]u8{ 0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    if (std.mem.eql(u8, bytes[0..12], &well_known_nat64_prefix)) {
+        return isPublicIpv4(bytes[12..16].*);
+    }
+
     const in_ipv6_global_unicast = (bytes[0] & 0xe0) == 0x20;
     if (std.Io.net.Ip4Address.fromIp6(.{ .bytes = bytes, .port = 0 })) |ip4| {
         return isPublicIpv4(ip4.bytes) and in_ipv6_global_unicast;
@@ -639,6 +644,12 @@ test "web_fetch fixtures every blocked ipv4 range ipv6 envelope exclusion and em
 
     const public_ipv6 = try std.Io.net.IpAddress.parse("2606:4700:4700::1111", 443);
     try std.testing.expect(isPublicAddress(public_ipv6));
+
+    const public_nat64 = try std.Io.net.IpAddress.parse("64:ff9b::5db8:d822", 443);
+    try std.testing.expect(isPublicAddress(public_nat64));
+
+    const private_nat64 = try std.Io.net.IpAddress.parse("64:ff9b::7f00:1", 443);
+    try std.testing.expect(!isPublicAddress(private_nat64));
 }
 
 test "web_fetch rejects public and private ipv4 mapped ipv6 literals" {
