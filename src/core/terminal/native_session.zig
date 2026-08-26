@@ -17,6 +17,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const execution_router = @import("../execution/router.zig");
 const io_mod = @import("../shared/io.zig");
+const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const workspace_pathing = @import("../workspace/pathing.zig");
@@ -665,6 +666,8 @@ const UnsupportedRegistry = struct {
         return .{ .alloc = alloc };
     }
 
+    pub fn shutdownSessionsOnly(_: *UnsupportedRegistry) void {}
+
     pub fn deinit(self: *UnsupportedRegistry) void {
         self.* = undefined;
     }
@@ -832,6 +835,36 @@ const SupportedRegistry = struct {
         self.releaseReference(slot.index, session);
         reserved = false;
         session_owned = false;
+    }
+
+    /// Kills every live session's process without freeing any session state.
+    ///
+    /// For a host that must exit while client threads are still running: those
+    /// threads may hold session pointers, so nothing here may be destroyed, but
+    /// the child processes still have to be signalled or they outlive the host
+    /// that owns them. `deinit` does both; this does only the half that is safe
+    /// while other threads are reading.
+    pub fn shutdownSessionsOnly(self: *SupportedRegistry) void {
+        const zio = io_mod.getIo();
+        // Take a reference on every live session before releasing the lock.
+        // A bare pointer copy would not stop a client that still holds the
+        // registry from recycling a reference-free slot and destroying the
+        // session this loop is about to signal, which is the use-after-free
+        // this drain exists to prevent. Recycling skips a referenced slot.
+        var pinned: [max_sessions]?*Session = @splat(null);
+        self.mutex.lockUncancelable(zio);
+        for (&self.sessions, 0..) |*entry, index| {
+            const session = entry.* orelse continue;
+            self.references[index] += 1;
+            pinned[index] = session;
+        }
+        self.mutex.unlock(zio);
+
+        for (&pinned, 0..) |maybe_session, index| {
+            const session = maybe_session orelse continue;
+            session.shutdown();
+            self.releaseReference(index, session);
+        }
     }
 
     pub fn deinit(self: *SupportedRegistry) void {
@@ -3135,6 +3168,20 @@ const SignalTarget = struct {
     token: process_supervisor.ProcessInstanceToken,
 };
 
+const ProcessGroupDelivery = enum {
+    delivered,
+    missing,
+    failed,
+};
+
+fn shouldPauseRecoveredTmuxProcess(
+    lifecycle: contracts.Lifecycle,
+    terminal_present: bool,
+    child_pid_present: bool,
+) bool {
+    return lifecycle == .starting and !terminal_present and child_pid_present;
+}
+
 const Session = struct {
     alloc: Allocator,
     tracker: WorkTracker,
@@ -3373,10 +3420,7 @@ const Session = struct {
             pinnedShell(request.shell, self.shell),
         );
 
-        const executable = try std.process.executablePathAlloc(
-            io_mod.getIo(),
-            self.alloc,
-        );
+        const executable = try self_exe.pathForPeerReexec(self.alloc);
         defer self.alloc.free(executable);
         var paths = try tmux_session.Paths.init(
             self.alloc,
@@ -3485,10 +3529,7 @@ const Session = struct {
         durable_root: []const u8,
         transport_root: []const u8,
     ) !bool {
-        const executable = try std.process.executablePathAlloc(
-            io_mod.getIo(),
-            self.alloc,
-        );
+        const executable = try self_exe.pathForPeerReexec(self.alloc);
         defer self.alloc.free(executable);
         const backend = tmux_session.Backend.recover(
             self.alloc,
@@ -3550,7 +3591,11 @@ const Session = struct {
             }
         }
         if (tmuxRecoveryFailure(self.id, "identity")) return error.InjectedFailure;
-        const process_paused = !terminal_present and self.child_pid != null;
+        const process_paused = shouldPauseRecoveredTmuxProcess(
+            self.lifecycle,
+            terminal_present,
+            self.child_pid != null,
+        );
         if (process_paused and !self.signalNative(std.c.SIG.STOP)) {
             return error.TmuxChildIdentityUnavailable;
         }
@@ -3731,10 +3776,7 @@ const Session = struct {
             null;
         defer if (command_path) |path| self.alloc.free(path);
 
-        const executable = try std.process.executablePathAlloc(
-            io_mod.getIo(),
-            self.alloc,
-        );
+        const executable = try self_exe.pathForPeerReexec(self.alloc);
         defer self.alloc.free(executable);
         const bootstrap = try shell_resolver.buildBootstrap(
             self.alloc,
@@ -4145,6 +4187,10 @@ const Session = struct {
         };
         if (!self.matchesSignalTarget(target)) return false;
 
+        const shell_group_delivery = if (failSignalStageForTest("shell_group"))
+            ProcessGroupDelivery.failed
+        else
+            self.signalVerifiedProcessGroup(target, signal);
         var descendants_delivery = descendants.signalOutsideProcessGroupChecked(
             signalValue(signal),
             target.pid,
@@ -4159,8 +4205,27 @@ const Session = struct {
         );
         return terminalSignalCompleted(
             descendants_delivery,
-            !failSignalStageForTest("shell_group") and self.signalProcess(signal),
+            shell_group_delivery,
         );
+    }
+
+    fn signalVerifiedProcessGroup(
+        self: *Session,
+        target: SignalTarget,
+        signal: contracts.Signal,
+    ) ProcessGroupDelivery {
+        if (!self.matchesSignalTarget(target)) {
+            return if (processGroupMissing(target.pid)) .missing else .failed;
+        }
+        while (true) switch (std.c.errno(std.c.kill(
+            -target.pid,
+            signalValue(signal),
+        ))) {
+            .SUCCESS => return .delivered,
+            .INTR => continue,
+            .SRCH => return .missing,
+            else => return .failed,
+        };
     }
 
     fn signalNative(self: *Session, signal: std.c.SIG) bool {
@@ -5514,9 +5579,45 @@ fn signalAction(
 
 fn terminalSignalCompleted(
     descendants: process_tree.DeliverySummary,
-    shell_group_delivered: bool,
+    shell_group: ProcessGroupDelivery,
 ) bool {
-    return !descendants.incomplete and shell_group_delivered;
+    return !descendants.incomplete and shell_group != .failed;
+}
+
+fn processGroupMissing(pid: std.posix.pid_t) bool {
+    while (true) switch (std.c.errno(std.c.kill(
+        -pid,
+        @enumFromInt(0),
+    ))) {
+        .SUCCESS, .PERM => return false,
+        .INTR => continue,
+        .SRCH => return true,
+        else => return false,
+    };
+}
+
+test "running tmux recovery does not pause the published process group" {
+    try std.testing.expect(!shouldPauseRecoveredTmuxProcess(
+        .running,
+        false,
+        true,
+    ));
+    try std.testing.expect(shouldPauseRecoveredTmuxProcess(
+        .starting,
+        false,
+        true,
+    ));
+}
+
+test "terminal signaling accepts a process group that exited during descendant delivery" {
+    try std.testing.expect(terminalSignalCompleted(
+        .{ .delivered = 1 },
+        .missing,
+    ));
+    try std.testing.expect(!terminalSignalCompleted(
+        .{ .delivered = 1, .incomplete = true },
+        .missing,
+    ));
 }
 
 fn failSignalStageForTest(stage: []const u8) bool {
@@ -6266,12 +6367,12 @@ test "terminal outcomes preserve exact exit and signal status" {
 }
 
 test "terminal signal completion requires checked descendants and shell group" {
-    try std.testing.expect(terminalSignalCompleted(.{}, true));
+    try std.testing.expect(terminalSignalCompleted(.{}, .delivered));
     try std.testing.expect(!terminalSignalCompleted(.{
         .delivered = 1,
         .incomplete = true,
-    }, true));
-    try std.testing.expect(!terminalSignalCompleted(.{}, false));
+    }, .delivered));
+    try std.testing.expect(!terminalSignalCompleted(.{}, .failed));
 }
 
 test "force close fallback does not erase an incomplete tree operation" {
@@ -7213,4 +7314,124 @@ test "malformed raw fallback durably replaces an invalid checkpoint with corrupt
         contracts.ScreenRecovery{ .unavailable = .corrupt },
         reopened.facts().screen_recovery,
     );
+}
+
+test "shutdownSessionsOnly signals live sessions and leaves them allocated" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-shutdown-only");
+    var probe: WorkProbe = .{};
+    var session = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer session.deinitUnlaunched();
+
+    session.markLive();
+    session.lifecycle = .running;
+    // A real handle, so releasing it is observable rather than vacuous.
+    session.liveness_file = try std.Io.Dir.createFileAbsolute(
+        io_mod.getIo(),
+        "/dev/null",
+        .{ .truncate = false },
+    );
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+    };
+    registry.sessions[0] = &session;
+
+    // A slot with no outstanding reference is exactly the slot a client may
+    // recycle, so this is the case the pin has to cover.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
+    registry.shutdownSessionsOnly();
+
+    // Every reference taken to pin the session for shutdown is given back, so
+    // the drain cannot wedge a later removeOwned that waits for the count.
+    try std.testing.expectEqual(@as(usize, 0), registry.references[0]);
+
+    // The liveness handle is released, so the session was actually shut down.
+    try std.testing.expect(session.liveness_file == null);
+    // And the session is still allocated: the registry slot still points at it
+    // and the object is readable, which is what makes this safe to call while
+    // client threads still hold session pointers.
+    try std.testing.expect(registry.sessions[0] == &session);
+    try std.testing.expectEqual(contracts.Lifecycle.running, session.lifecycle);
+}
+
+test "a referenced slot is never recycled out from under its holder" {
+    if (!isSupported()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var fixture = try TestDurableFixture.init(alloc);
+    defer fixture.deinit();
+    const id = try alloc.dupe(u8, "terminal-recycle-guard");
+    var probe: WorkProbe = .{};
+    var resident = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer resident.deinitUnlaunched();
+    resident.lifecycle = .exited;
+    try std.testing.expect(resident.isRecyclable());
+
+    const incoming_id = try alloc.dupe(u8, "terminal-recycle-incoming");
+    var incoming = try Session.init(
+        alloc,
+        .{ .context = &probe, .update_fn = WorkProbe.update },
+        &fixture.profile,
+        "test-host",
+        incoming_id,
+        .{
+            .cwd = "/workspace",
+            .shell = .{ .executable = .{ .path = "/bin/zsh" } },
+        },
+        testPersistence("/workspace"),
+    );
+    defer incoming.deinitUnlaunched();
+
+    var registry = SupportedRegistry{
+        .alloc = alloc,
+        .tracker = .{ .context = &probe, .update_fn = WorkProbe.update },
+        .profile = &fixture.profile,
+        .host_identity = "test-host",
+        .durable_root = "/workspace",
+        .transport_root = "/workspace",
+        .sessions = @splat(&resident),
+        .references = @splat(1),
+    };
+
+    // Every slot holds a recyclable session, so only the reference keeps them.
+    // This is what makes it safe to signal a session after releasing the lock.
+    try std.testing.expect(registry.reserve(&incoming) == null);
+
+    // Drop the references and the same slots become recyclable again, so the
+    // check above is about the reference and not about some other refusal.
+    registry.references = @splat(0);
+    const reservation = registry.reserve(&incoming) orelse
+        return error.TestExpectedRecycle;
+    try std.testing.expectEqual(@as(?*Session, &resident), reservation.evicted);
 }

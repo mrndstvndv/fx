@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -16,6 +17,7 @@ import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewaySse,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -57,6 +59,52 @@ function grokModalityModel(id: string, vision: boolean) {
     id,
     input_modalities: vision ? ["text", "image"] : ["text"],
     output_modalities: ["text"],
+  };
+}
+
+function startFakeDirectUsageProvider(
+  provider: "codex" | "grok",
+  model: string,
+  responseId: string,
+  inputTokens: number,
+  outputTokens: number,
+) {
+  let responses = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path === "/models") {
+        return provider === "codex"
+          ? Response.json({ models: [{
+            slug: model,
+            visibility: "list",
+            supported_in_api: true,
+            supported_reasoning_levels: [{ effort: "high" }],
+            additional_speed_tiers: [],
+            input_modalities: ["text"],
+            context_window: 272000,
+          }] })
+          : Response.json({ data: [grokSubscriptionModel(model, 500_000)] });
+      }
+      if (path === "/modalities") {
+        return Response.json({ models: [grokModalityModel(model, false)] });
+      }
+      responses += 1;
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: `${provider.toUpperCase()}_USAGE_OK` })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: responseId, status: "completed", usage: { input_tokens: inputTokens, output_tokens: outputTokens } } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    get responses() { return responses; },
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    modalitiesUrl: `http://127.0.0.1:${server.port}/modalities`,
+    stop() { server.stop(true); },
   };
 }
 
@@ -115,6 +163,36 @@ function writeSeededGrokLogin(testHome: string, accessToken: string, accountId =
     account_id: accountId,
   }) + "\n", { mode: 0o600 });
   chmodSync(authPath, 0o600);
+}
+
+function readSingleUsageSnapshot(testHome: string): {
+  billing: string;
+  next_sequence: number;
+  settled_through_sequence: number;
+  input_tokens: number;
+  output_tokens: number;
+  request_count: number | null;
+  models: Array<{ model: string; request_count: number | null }>;
+  pending: unknown[];
+} {
+  const sessionsDir = join(testHome, ".fx", "sessions");
+  const usagePaths = readdirSync(sessionsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(sessionsDir, entry.name, "usage-v2.json"))
+    .filter((path) => existsSync(path));
+  expect(usagePaths).toHaveLength(1);
+  return (JSON.parse(readFileSync(usagePaths[0]!, "utf8")) as {
+    snapshot: {
+      billing: string;
+      next_sequence: number;
+      settled_through_sequence: number;
+      input_tokens: number;
+      output_tokens: number;
+      request_count: number | null;
+      models: Array<{ model: string; request_count: number | null }>;
+      pending: unknown[];
+    };
+  }).snapshot;
 }
 
 function writeSeededFxLogin(
@@ -593,7 +671,10 @@ function startFakeGrokOAuth(options: {
   };
 }
 
-async function runGrokLoginWithBrowser(env: Record<string, string | undefined>) {
+async function runGrokLoginWithBrowser(
+  env: Record<string, string | undefined>,
+  authorizationCode?: string,
+) {
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete childEnv[key];
@@ -602,7 +683,7 @@ async function runGrokLoginWithBrowser(env: Record<string, string | undefined>) 
   const proc = nodeSpawn(FX_BIN, ["login", "grok"], {
     cwd: REPO_ROOT,
     env: childEnv,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [authorizationCode ? "pipe" : "ignore", "pipe", "pipe"],
   });
   let stdout = "";
   let stderr = "";
@@ -619,8 +700,12 @@ async function runGrokLoginWithBrowser(env: Record<string, string | undefined>) 
     proc.kill("SIGTERM");
     throw new Error(`Grok login did not print an authorization URL: ${stdout}\n${stderr}`);
   }
-  const response = await fetch(authorizationUrl, { redirect: "follow" });
-  expect(response.status).toBe(200);
+  if (authorizationCode) {
+    proc.stdin!.end(`${authorizationCode}\n`);
+  } else {
+    const response = await fetch(authorizationUrl, { redirect: "follow" });
+    expect(response.status).toBe(200);
+  }
   const code = await new Promise<number>((resolve, reject) => {
     proc.once("error", reject);
     proc.once("close", (value) => resolve(value ?? 1));
@@ -747,6 +832,45 @@ function startFakeCodexToolLoop(options: {
   };
 }
 
+function startFakeCodexCapacityLoop() {
+  const bodies: string[] = [];
+  const accessToken = chatgptAccessToken("acct_capacity_loop");
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname === "/models") {
+        return Response.json({ models: [
+          { slug: "gpt-5.6-sol", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "high" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+        ] });
+      }
+      bodies.push(await request.text());
+      const call = bodies.length;
+      if (call <= 64) {
+        return new Response(
+          `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", call_id: `call_capacity_${call}`, name: "read_file" } })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 0, arguments: JSON.stringify({ path: "README.md", start_line: call, line_count: 1 }) })}\n\n` +
+            `data: ${JSON.stringify({ type: "response.completed", response: { id: `resp_capacity_${call}`, status: "completed", usage: { input_tokens: 5, output_tokens: 2 } } })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      const text = call === 65 ? "CODEX_CAPACITY_65_OK" : "CODEX_CAPACITY_NEXT_OK";
+      return new Response(
+        `data: ${JSON.stringify({ type: "response.output_text.delta", delta: text })}\n\n` +
+          `data: ${JSON.stringify({ type: "response.completed", response: { id: `resp_capacity_${call}`, status: "completed", usage: { input_tokens: 7, output_tokens: 3 } } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+  return {
+    accessToken,
+    bodies,
+    responsesUrl: `http://127.0.0.1:${server.port}/responses`,
+    modelsUrl: `http://127.0.0.1:${server.port}/models`,
+    stop() { server.stop(true); },
+  };
+}
+
 function startFakeGrokToolLoop(options: {
   toolName?: string;
   toolArguments?: object;
@@ -817,7 +941,7 @@ function startFakeCodexAutoReview() {
       if (model === "gpt-5.4-mini") {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_permission","name":"permission_decision"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"authorization\\":\\"high\\",\\"decision\\":\\"allow\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"decision\\":\\"clear\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_review","status":"completed","usage":{"input_tokens":8,"output_tokens":3}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -826,7 +950,7 @@ function startFakeCodexAutoReview() {
       if (mainRequests === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\",\\"timeout_ms\\":600000}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -883,7 +1007,7 @@ function startFakeGrokAutoReview() {
       if (body.includes('"name":"permission_decision"')) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_permission","name":"permission_decision"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"authorization\\":\\"high\\",\\"decision\\":\\"allow\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"risk\\":\\"low\\",\\"decision\\":\\"clear\\",\\"rationale\\":\\"The user requested this harmless command.\\"}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_review","status":"completed","usage":{"input_tokens":8,"output_tokens":3}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -892,7 +1016,7 @@ function startFakeGrokAutoReview() {
       if (mainRequests === 1) {
         return new Response(
           'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_terminal","name":"terminal"}}\n\n' +
-            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\"}"}\n\n' +
+            'data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\\"action\\":\\"exec\\",\\"command\\":\\"pwd\\",\\"timeout_ms\\":600000}"}\n\n' +
             'data: {"type":"response.completed","response":{"id":"gen_main_1","status":"completed","usage":{"input_tokens":5,"output_tokens":2}}}\n\n',
           { headers: { "content-type": "text/event-stream" } },
         );
@@ -972,7 +1096,9 @@ tmuxTest(
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
       (pane) =>
@@ -1015,7 +1141,9 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Codex subscription", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
@@ -1145,11 +1273,11 @@ tmuxTest(
       (request) => request.path === "/oauth/authorize",
     ).length;
     const settingsPath = join(home, ".fx", "settings.json");
-    const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).model;
+    const gatewayModelBefore = JSON.parse(readFileSync(settingsPath, "utf8")).models.gateway;
     expect(typeof gatewayModelBefore).toBe("string");
     const savedCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
-    expect(savedCodex.model).toBe(gatewayModelBefore);
-    expect(savedCodex.codex_model).toBe("gpt-5.6-sol");
+    expect(savedCodex.models.gateway).toBe(gatewayModelBefore);
+    expect(savedCodex.models.codex).toBe("gpt-5.6-sol");
     await session.sendText("/quit");
     await session.waitForSessionEnd(TIMEOUT);
     session = null;
@@ -1174,16 +1302,16 @@ tmuxTest(
     await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
     const savedGateway = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(savedGateway.provider).toBe("gateway");
-    expect(savedGateway.model).toBe(gatewayModelBefore);
-    expect(savedGateway.codex_model).toBe("gpt-5.6-sol");
+    expect(savedGateway.models.gateway).toBe(gatewayModelBefore);
+    expect(savedGateway.models.codex).toBe("gpt-5.6-sol");
     await openProviderPicker(session);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
     const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(restoredCodex.provider).toBe("codex");
-    expect(restoredCodex.model).toBe(gatewayModelBefore);
-    expect(restoredCodex.codex_model).toBe("gpt-5.6-sol");
+    expect(restoredCodex.models.gateway).toBe(gatewayModelBefore);
+    expect(restoredCodex.models.codex).toBe("gpt-5.6-sol");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip);
     await session.sendText("/logout codex");
@@ -1201,7 +1329,7 @@ tmuxTest(
     await session.waitForText("Switched to Codex subscription with gpt-5.4-mini.", TIMEOUT);
     const reauthenticated = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(reauthenticated.provider).toBe("codex");
-    expect(reauthenticated.codex_model).toBe("gpt-5.4-mini");
+    expect(reauthenticated.models.codex).toBe("gpt-5.4-mini");
     expect(chatgptOauth.requests.filter((request) => request.path === "/oauth/authorize"))
       .toHaveLength(authorizeRequestsBeforeRoundTrip + 1);
     await session.sendKeys("C-c");
@@ -1231,7 +1359,9 @@ tmuxTest(
     );
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Codex subscription", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
     await completeDisplayedCodexLogin(session, chatgptOauth);
@@ -1239,7 +1369,7 @@ tmuxTest(
 
     const selected = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
     expect(selected.provider).toBe("codex");
-    expect(selected.codex_model).toBe("gpt-5.6-sol");
+    expect(selected.models.codex).toBe("gpt-5.6-sol");
     await session.sendText("/status");
     await session.waitForText("model_source=Codex subscription", TIMEOUT);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -1306,20 +1436,22 @@ tmuxTest(
     const root = await session.waitForPane(
       (pane) =>
         pane.includes("Setup") &&
-        pane.includes("Sign in with Vercel") &&
-        pane.includes("Sign in with Codex") &&
-        pane.includes("Sign in with Grok") &&
-        pane.includes("API key") &&
-        pane.includes("Switch provider"),
+        pane.includes("Connections") &&
+        pane.includes("Model provider") &&
+        pane.includes("Vercel team") &&
+        pane.includes("Credential source"),
       TIMEOUT,
     );
-    expect(root).not.toContain("AI_GATEWAY_API_KEY");
+    expect(root).toContain("AI_GATEWAY_API_KEY");
     expect(root).not.toContain("fx login");
+    expect(root).not.toContain("Vercel account");
 
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Enter reopens browser · Esc cancels", TIMEOUT);
     await session.sendKeys("Escape");
-    await session.waitForText("Setup", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1328,23 +1460,31 @@ tmuxTest(
     const apiKey = await session.waitForText("Paste your AI Gateway API key", TIMEOUT);
     expect(apiKey).toContain("Saves to");
     await session.sendKeys("Escape");
-    await session.waitForText("Setup", TIMEOUT);
-
-    await session.sendKeys("Down");
-    await session.sendKeys("Enter");
-    await session.waitForText("Switch provider", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
     await session.sendKeys("Escape");
     await session.waitForText("Setup", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Choose a Vercel team", TIMEOUT);
+    await session.waitForPane(
+      (pane) => pane.includes("Model provider") && pane.includes("Grok subscription"),
+      TIMEOUT,
+    );
     await session.sendKeys("Escape");
-    await session.waitForText("Switch credential", TIMEOUT);
+    await session.waitForText("Setup", TIMEOUT);
 
     await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    const sources = await session.waitForText("Use this credential", TIMEOUT);
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.sendKeys("Escape");
+    await session.waitForText("Credential source", TIMEOUT);
+
+    await session.sendKeys("Down");
+    await session.sendKeys("Enter");
+    const sources = await session.waitForPane(
+      (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+      TIMEOUT,
+    );
     expect(sources).toContain("AI_GATEWAY_API_KEY");
     expect(sources).toContain("fx login");
     await session.sendKeys("Escape");
@@ -1352,6 +1492,43 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(session.isAlive()).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "first-run Vercel team Escape continues into the setup hub",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-onboarding-team-back-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(
+      ACQUIRED_LOGIN_TOKEN,
+      undefined,
+      3600,
+      Number.POSITIVE_INFINITY,
+      {
+        teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+      },
+    );
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_SKIP_ONBOARDING: "0",
+    });
+    await session.waitForText("Welcome to fx", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.sendKeys("Escape");
+    const setup = await session.waitForPane(
+      (pane) => pane.includes("Setup") && /Connections\s+connected/.test(pane),
+      TIMEOUT,
+    );
+    expect(setup).toMatch(/^› Vercel team\s+choose a team$/m);
+    expect(setup).not.toContain("Welcome to fx");
+    expect(setup).not.toContain("sign in to manage");
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -1410,21 +1587,23 @@ async function waitForTrace(tracePath: string, needle: string): Promise<void> {
 }
 
 async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> {
-  for (let index = 0; index < 6; index += 1) {
-    await pickerSession.sendKeys("Down");
-  }
+  await pickerSession.sendKeys("Up");
   await pickerSession.sendKeys("Enter");
-  await pickerSession.waitForText("Use this credential", TIMEOUT);
+  await pickerSession.waitForPane(
+    (pane) => pane.includes("Credential source") && pane.includes("Automatic"),
+    TIMEOUT,
+  );
 }
 
 async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
   await pickerSession.sendText("/setup");
   await pickerSession.waitForText("Setup", TIMEOUT);
-  for (let index = 0; index < 4; index += 1) {
-    await pickerSession.sendKeys("Down");
-  }
+  await pickerSession.sendKeys("Down");
   await pickerSession.sendKeys("Enter");
-  await pickerSession.waitForText("Switch provider", TIMEOUT);
+  await pickerSession.waitForPane(
+    (pane) => pane.includes("Model provider") && pane.includes("Grok subscription"),
+    TIMEOUT,
+  );
 }
 
 async function openSwitchCredential(pickerSession: TmuxSession): Promise<void> {
@@ -1456,7 +1635,9 @@ profileStoredKeyTmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
     await session.sendText("/setup");
-    await session.waitForText("API key", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("AI Gateway API key", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Down");
     await session.sendKeys("Down");
@@ -1465,6 +1646,11 @@ profileStoredKeyTmuxTest(
     await session.sendLiteralText(STORED_TOKEN);
     await session.sendKeys("Enter");
     await session.waitForText("Saved the API key to profile file and made it active", TIMEOUT);
+    const returnedConnections = await session.waitForPane(
+      (pane) => pane.includes("Connections") && pane.includes("AI Gateway API key"),
+      TIMEOUT,
+    );
+    expect(returnedConnections).toMatch(/^› AI Gateway API key\s+stored$/m);
     await session.sendText("/status");
     await session.waitForText("auth=stored API key (profile file)", TIMEOUT);
     expect(savedCredentialSource(home)).toBe("stored_key");
@@ -1510,7 +1696,9 @@ tmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
 
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Signed in to Vercel", TIMEOUT);
     await session.sendText("/status");
@@ -1582,11 +1770,8 @@ tmuxTest(
     await session.waitForText("Setup", TIMEOUT);
     await session.sendKeys("Down");
     await session.sendKeys("Down");
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
-    await session.sendKeys("Down");
     await session.sendKeys("Enter");
-    await session.waitForText("Choose a Vercel team", TIMEOUT);
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.sendKeys("Enter");
     await session.waitForText("Changed Vercel team to Vercel Labs", TIMEOUT);
     await session.sendText("/status");
@@ -1680,7 +1865,9 @@ tmuxTest(
     expect(gateway.requests[2].headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
 
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel account", TIMEOUT);
     await session.sendKeys("Enter");
     const loginCompleted = await session.waitForText("Signed in to Vercel", TIMEOUT);
     expect(loginCompleted).not.toContain("Setup");
@@ -1803,9 +1990,20 @@ tmuxTest(
     expect(gateway.modelRequests[0].headers.get("authorization")).toBeNull();
 
     await session.sendText("/login");
-    await session.waitForText("Sign in with Codex", TIMEOUT);
+    await session.waitForText("Connections", TIMEOUT);
     await session.sendKeys("Enter");
-    await session.waitForText("Choose a Vercel team", TIMEOUT);
+    await session.waitForText("Vercel account", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
+    await session.sendKeys("Escape");
+    const setupAfterSignIn = await session.waitForPane(
+      (pane) => pane.includes("Setup") && /Connections\s+connected/.test(pane),
+      TIMEOUT,
+    );
+    expect(setupAfterSignIn).toMatch(/^› Vercel team\s+choose a team$/m);
+    expect(setupAfterSignIn).not.toContain("sign in to manage");
+    await session.sendKeys("Enter");
+    await session.waitForText("Vercel team · Search:", TIMEOUT);
     await session.resizeWindow(80, 5);
     await session.sendLiteralText("example");
     await session.waitForPane((pane) => pane.includes("Search: example"), TIMEOUT);
@@ -1822,7 +2020,7 @@ tmuxTest(
     await session.resizeWindow(80, 24);
     await session.waitForPane(
       (pane) =>
-        pane.includes("Choose a Vercel team") &&
+        pane.includes("Vercel team · Search:") &&
         pane.includes("Search: example") &&
         pane.includes("Example Internal Team") &&
         !pane.includes("Other Team"),
@@ -2002,7 +2200,7 @@ test(
     const settingsPath = join(home, ".fx", "settings.json");
     const selected = JSON.parse(readFileSync(settingsPath, "utf8"));
     expect(selected.provider).toBe("codex");
-    expect(selected.codex_model).toBe("gpt-5.6-sol");
+    expect(selected.models.codex).toBe("gpt-5.6-sol");
 
     const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
     const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
@@ -2098,7 +2296,7 @@ test(
       expect(statSync(authPath).mode & 0o077).toBe(0);
       const settings = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
       expect(settings.provider).toBe("grok");
-      expect(settings.grok_model).toBe("grok-4.20");
+      expect(settings.models.grok).toBe("grok-4.20");
 
       const models = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
       const modelIds = (JSON.parse(models.stdout) as { models: Array<{ id: string }> }).models
@@ -2160,6 +2358,39 @@ test(
     }
   },
   60_000,
+);
+
+test(
+  "Grok CLI accepts an authorization code copied from the browser",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-cli-code-"));
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth();
+    try {
+      const result = await runGrokLoginWithBrowser({
+        HOME: home,
+        AI_GATEWAY_API_KEY: ENV_TOKEN,
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SKIP_ONBOARDING: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_NO_OPEN_BROWSER: "1",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        ...grok.env,
+      }, "grok-code");
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain("Signed in with Grok.");
+      expect(result.stdout).not.toContain("grok-code");
+      expect(result.stderr).toBe("");
+      expect(grok.tokenCalls()).toBe(1);
+      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
+    } finally {
+      grok.stop();
+    }
+  },
+  15_000,
 );
 
 test("Grok logout removes local credentials when remote revocation fails", async () => {
@@ -2300,7 +2531,9 @@ tmuxTest(
       await session.waitForText("auto ·", TIMEOUT);
 
       await session.sendText("/login");
-      await session.waitForText("Sign in with Grok", TIMEOUT);
+      await session.waitForText("Connections", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Grok subscription", TIMEOUT);
       await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
@@ -2322,11 +2555,11 @@ tmuxTest(
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       const settingsPath = join(home, ".fx", "settings.json");
       const persistenceDeadline = Date.now() + TIMEOUT;
-      let saved: { provider: string; grok_model: string } | undefined;
+      let saved: { provider: string; models: { grok: string } } | undefined;
       while (Date.now() < persistenceDeadline) {
         saved = JSON.parse(readFileSync(settingsPath, "utf8")) as {
           provider: string;
-          grok_model: string;
+          models: { grok: string };
         };
         if (saved.provider === "grok") break;
         await Bun.sleep(25);
@@ -2334,10 +2567,60 @@ tmuxTest(
       expect(saved).toBeDefined();
       expect(grok.tokenCalls()).toBe(tokenCallsAfterLogin);
       expect(saved!.provider).toBe("grok");
-      expect(saved!.grok_model).toBe("grok-4.20");
+      expect(saved!.models.grok).toBe("grok-4.20");
       const responses = grok.requests.filter((request) => request.path === "/v1/responses");
       expect(responses).toHaveLength(1);
       expect(responses[0]!.conversationId).toBeTruthy();
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "interactive Grok login accepts a bracketed-paste authorization code",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-grok-tui-code-"));
+    stderrPath = join(home, "stderr.log");
+    gateway = startFakeGateway([]);
+    const grok = startFakeGrokOAuth();
+    try {
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        ...grok.env,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("/login");
+      await session.waitForText("Connections", TIMEOUT);
+      await session.sendKeys("Enter");
+      await session.waitForText("Grok subscription", TIMEOUT);
+      await session.sendKeys("Down");
+      await session.sendKeys("Down");
+      await session.sendKeys("Enter");
+      await session.waitForText("Paste the code shown by xAI", TIMEOUT);
+      await session.resizeWindow(80, 5);
+      const compactEntry = await session.waitForPane(
+        (pane) =>
+          pane.includes("Paste or type the code") &&
+          pane.includes("Enter submits") &&
+          pane.includes("Esc cancels"),
+        TIMEOUT,
+      );
+      expect(compactEntry).not.toContain("Paste the code shown by xAI");
+      await session.pasteText("grok-code");
+      await session.waitForPane(
+        (pane) => pane.includes("•••••••••") && pane.includes("Enter submits"),
+        TIMEOUT,
+      );
+      await session.sendKeys("Enter");
+      await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain("grok-code");
+      expect(grok.tokenCalls()).toBe(1);
+      expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     } finally {
       grok.stop();
@@ -2477,6 +2760,44 @@ test(
     }
   },
   60_000,
+);
+
+tmuxTest(
+  "Codex remains usable beyond Gateway observation capacity in one process",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-codex-capacity-loop-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    const codex = startFakeCodexCapacityLoop();
+    try {
+      writeSeededChatGptLogin(home, codex.accessToken);
+      writeFileSync(
+        join(home, ".fx", "settings.json"),
+        JSON.stringify({ provider: "codex", codex_model: "gpt-5.6-sol" }) + "\n",
+        { mode: 0o600 },
+      );
+      session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+        FX_MODEL: undefined,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Read enough lines to complete the capacity loop.");
+      await session.waitForText("CODEX_CAPACITY_65_OK", 120_000);
+      expect(codex.bodies).toHaveLength(65);
+
+      await session.sendText("Confirm the same process remains usable.");
+      await session.waitForText("CODEX_CAPACITY_NEXT_OK", TIMEOUT);
+      expect(codex.bodies).toHaveLength(66);
+      expect(await session.captureFullScrollback()).not.toContain("UsageCapacityExceeded");
+      expect(gateway.requests).toHaveLength(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      codex.stop();
+    }
+  },
+  150_000,
 );
 
 test(
@@ -2699,6 +3020,127 @@ test(
 );
 
 test(
+  "saved provider switching publishes Gateway, Codex, and Grok usage to one profile ledger",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-provider-usage-ledger-"));
+    const workspace = join(home, "workspace");
+    mkdirSync(workspace, { recursive: true });
+    gateway = startFakeGateway([
+      fakeGatewaySse([
+        {
+          type: "response-metadata",
+          modelId: FAKE_GATEWAY_MODEL,
+          timestamp: new Date().toISOString(),
+        },
+        {
+          type: "text-start",
+          id: "gateway_answer",
+          providerMetadata: {
+            gateway: { generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV" },
+          },
+        },
+        { type: "text-delta", id: "gateway_answer", delta: "GATEWAY_USAGE_OK" },
+        { type: "text-end", id: "gateway_answer" },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 13 },
+            outputTokens: { total: 4 },
+          },
+          providerMetadata: {
+            gateway: {
+              generationId: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+              cost: "0.01",
+              routing: { canonicalSlug: FAKE_GATEWAY_MODEL },
+            },
+          },
+        },
+      ]),
+    ]);
+    const codex = startFakeDirectUsageProvider(
+      "codex",
+      "gpt-5.6-sol",
+      "response-codex-profile",
+      17,
+      7,
+    );
+    const grok = startFakeDirectUsageProvider(
+      "grok",
+      "grok-4.20",
+      "response-grok-profile",
+      19,
+      5,
+    );
+    try {
+      writeSeededChatGptLogin(home, chatgptAccessToken("acct_usage"));
+      writeSeededGrokLogin(home, "grok-usage-token", "acct_usage");
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "gateway-usage-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_AUTO_UPGRADE: "0",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+        FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+      };
+      const settingsPath = join(home, ".fx", "settings.json");
+      const routes = [
+        { settings: { provider: "gateway", model: FAKE_GATEWAY_MODEL }, text: "GATEWAY_USAGE_OK" },
+        { settings: { provider: "codex", codex_model: "gpt-5.6-sol" }, text: "CODEX_USAGE_OK" },
+        { settings: { provider: "grok", grok_model: "grok-4.20" }, text: "GROK_USAGE_OK" },
+      ];
+      for (const route of routes) {
+        writeFileSync(settingsPath, JSON.stringify(route.settings) + "\n", { mode: 0o600 });
+        const result = await runFx(
+          ["ask", "--json", `Return ${route.text}.`],
+          { cwd: workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+        expect(result.stdout).toContain(route.text);
+      }
+
+      const usage = await runFx(
+        ["usage", "--json", "--period", "24h"],
+        { cwd: workspace, env: { HOME: home }, timeoutMs: TIMEOUT },
+      );
+      expect(usage.code, usage.stderr).toBe(0);
+      const report = JSON.parse(usage.stdout) as {
+        completeness: string;
+        totals: { input_tokens: number; output_tokens: number; request_count: number };
+        models: Array<{ model: string; totals: { request_count: number } }>;
+      };
+      expect(report.completeness).toBe("complete");
+      expect(report.totals).toMatchObject({
+        input_tokens: 49,
+        output_tokens: 16,
+        request_count: 3,
+      });
+      expect(Object.fromEntries(
+        report.models.map((model) => [model.model, model.totals.request_count]),
+      )).toEqual({
+        [FAKE_GATEWAY_MODEL]: 1,
+        "codex/gpt-5.6-sol": 1,
+        "grok/grok-4.20": 1,
+      });
+      expect(gateway.requests).toHaveLength(1);
+      expect(codex.responses).toBe(1);
+      expect(grok.responses).toBe(1);
+    } finally {
+      codex.stop();
+      grok.stop();
+    }
+  },
+  60_000,
+);
+
+test(
   "Codex automatic review uses gpt-5.4-mini while Gateway review stays untouched",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-codex-auto-review-"));
@@ -2712,7 +3154,7 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Run pwd, then finish."],
+        ["ask", "--json", "--auto", "Run pwd, then finish."],
         {
           env: {
             HOME: home,
@@ -2733,9 +3175,25 @@ test(
       expect(codex.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["gpt-5.6-sol", "gpt-5.4-mini", "gpt-5.6-sol"]);
       expect(codex.bodies[1]).toContain('"name":"permission_decision"');
+      expect(codex.bodies[2]).toContain('"type":"function_call_output"');
+      expect(codex.bodies[2]).toContain("exit_code=0");
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
+      expect(readSingleUsageSnapshot(home)).toMatchObject({
+        billing: "complete",
+        api_duration_complete: true,
+        next_sequence: 4,
+        settled_through_sequence: 3,
+        input_tokens: 20,
+        output_tokens: 8,
+        request_count: 3,
+        models: [
+          { model: "codex/gpt-5.6-sol", request_count: 2 },
+          { model: "codex/gpt-5.4-mini", request_count: 1 },
+        ],
+        pending: [],
+      });
     } finally {
       codex.stop();
     }
@@ -2757,7 +3215,7 @@ test(
         { mode: 0o600 },
       );
       const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Run pwd, then finish."],
+        ["ask", "--json", "--auto", "Run pwd, then finish."],
         {
           env: {
             HOME: home,
@@ -2779,6 +3237,8 @@ test(
       expect(grok.bodies.map((body) => (JSON.parse(body) as { model: string }).model))
         .toEqual(["grok-4.20", "grok-4.20", "grok-4.20"]);
       expect(grok.bodies[1]).toContain('"name":"permission_decision"');
+      expect(grok.bodies[2]).toContain('"type":"function_call_output"');
+      expect(grok.bodies[2]).toContain("exit_code=0");
       expect(grok.headers).toHaveLength(3);
       for (const headers of grok.headers) {
         expect(headers.tokenAuth).toBe("xai-grok-cli");
@@ -2791,6 +3251,17 @@ test(
       for (const request of gateway.requests) {
         expect(request.body).not.toContain("permission_decision");
       }
+      expect(readSingleUsageSnapshot(home)).toMatchObject({
+        billing: "complete",
+        api_duration_complete: true,
+        next_sequence: 4,
+        settled_through_sequence: 3,
+        input_tokens: 20,
+        output_tokens: 8,
+        request_count: 3,
+        models: [{ model: "grok/grok-4.20", request_count: 3 }],
+        pending: [],
+      });
     } finally {
       grok.stop();
     }
@@ -2985,7 +3456,7 @@ tmuxTest(
     await session.waitForText("auth=AI_GATEWAY_API_KEY", TIMEOUT);
     await openSwitchCredential(session);
     const inventory = await session.waitForPane(
-      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("Use this credential"),
+      (pane) => pane.includes("AI_GATEWAY_API_KEY") && pane.includes("Automatic"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+(?:current|available)\s*$/m);
@@ -3145,16 +3616,16 @@ tmuxTest(
     const inventory = await session.waitForPane(
       (pane) =>
         pane.includes("Setup") &&
-        pane.includes("Sign in with Vercel") &&
-        pane.includes("Sign in with Grok") &&
-        pane.includes("API key") &&
-        pane.includes("Switch provider"),
+        pane.includes("Connections") &&
+        pane.includes("Model provider") &&
+        pane.includes("Vercel team") &&
+        pane.includes("Credential source"),
       TIMEOUT,
     );
     expect(inventory).not.toMatch(/^\s+fx login\s+/m);
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => !pane.includes("   Setup"),
+      (pane) => !pane.includes("Connections") && !pane.includes("Routing"),
       TIMEOUT,
     );
 
@@ -3246,7 +3717,7 @@ tmuxTest(
         pane.includes("fx login credential refresh failed.") &&
         pane.includes("Choose another source below") &&
         pane.includes("Setup") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(failed).toContain(`${promptHead}${promptTail}`);
@@ -3480,14 +3951,14 @@ tmuxTest(
       (pane) =>
         pane.includes(blockedPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(blockedPrompt) && !pane.includes("   Setup"),
+      (pane) => pane.includes(blockedPrompt) && !pane.includes("Connections"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -3552,7 +4023,7 @@ tmuxTest(
       (pane) =>
         pane.includes(firstPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(firstFailure).toContain("Choose another source below.");
@@ -3565,7 +4036,7 @@ tmuxTest(
 
     await session.sendKeys("Escape");
     await session.waitForPane(
-      (pane) => pane.includes(firstPrompt) && !pane.includes("   Setup"),
+      (pane) => pane.includes(firstPrompt) && !pane.includes("Connections"),
       TIMEOUT,
     );
     await session.sendKeys("C-u");
@@ -3587,7 +4058,7 @@ tmuxTest(
       (pane) =>
         pane.includes(secondPrompt) &&
         pane.includes("fx login credential refresh failed.") &&
-        pane.includes("Switch provider"),
+        pane.includes("Model provider"),
       TIMEOUT,
     );
     expect(gateway.requests).toHaveLength(0);

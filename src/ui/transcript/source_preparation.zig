@@ -343,24 +343,7 @@ pub fn renderCompactTranscriptBytes(
     defer command_overrides.deinit(alloc);
     const styles = self.command_output_render.styles;
 
-    if (self.maxxing_mode == .legacy) {
-        const entry_actions = try buildCommandOutputActions(
-            alloc,
-            &command_overrides,
-            self.entries.items.len,
-        );
-        defer if (entry_actions.len > 0) alloc.free(entry_actions);
-        return transcript_blocks.renderEntriesWithProjectionToBytes(
-            alloc,
-            self.entries.items,
-            self.layout.cols,
-            styles,
-            entry_actions,
-            self.maxxing_mode,
-        );
-    }
-
-    var projection = try buildMinimalTranscriptProjection(
+    var projection = try buildCompactTranscriptProjection(
         self,
         alloc,
         &command_overrides,
@@ -373,7 +356,6 @@ pub fn renderCompactTranscriptBytes(
         self.layout.cols,
         styles,
         projection.entry_actions.items,
-        self.maxxing_mode,
     );
 }
 
@@ -452,10 +434,10 @@ fn prepareTranscriptSourceInternal(
 
     var command_overrides = try buildCommandOutputOverridesInterruptible(self, alloc, checkpoint);
     defer command_overrides.deinit(alloc);
-    var minimal_projection: ?tool_group_projection.Projection = null;
-    defer if (minimal_projection) |*projection| projection.deinit(alloc);
-    if (self.maxxing_mode == .minimal and self.entries.items.len > 0 and self.layout.cols > 0) {
-        minimal_projection = try buildMinimalTranscriptProjectionInterruptible(
+    var compact_projection: ?tool_group_projection.Projection = null;
+    defer if (compact_projection) |*projection| projection.deinit(alloc);
+    if (self.entries.items.len > 0 and self.layout.cols > 0) {
+        compact_projection = try buildCompactTranscriptProjectionInterruptible(
             self,
             alloc,
             &command_overrides,
@@ -464,7 +446,7 @@ fn prepareTranscriptSourceInternal(
         );
     }
 
-    const aligned_actions = if (minimal_projection == null)
+    const aligned_actions = if (compact_projection == null)
         try buildCommandOutputActions(
             alloc,
             &command_overrides,
@@ -474,7 +456,7 @@ fn prepareTranscriptSourceInternal(
         &.{};
     defer if (aligned_actions.len > 0) alloc.free(aligned_actions);
 
-    const entry_actions = if (minimal_projection) |*projection|
+    const entry_actions = if (compact_projection) |*projection|
         projection.entry_actions.items
     else
         aligned_actions;
@@ -499,11 +481,11 @@ fn prepareTranscriptSourceInternal(
         defer finality_nominations.deinit(alloc);
         const finality_entry_ids = try alloc.alloc(u32, finality_nominations.items.len);
         defer alloc.free(finality_entry_ids);
-        const finality_entry_start_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
-        defer alloc.free(finality_entry_start_bytes);
+        const finality_entry_floor_bytes = try alloc.alloc(?usize, finality_nominations.items.len);
+        defer alloc.free(finality_entry_floor_bytes);
         for (finality_nominations.items, 0..) |nomination, index| {
             finality_entry_ids[index] = nomination.entry_id;
-            finality_entry_start_bytes[index] = null;
+            finality_entry_floor_bytes[index] = null;
         }
         const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
         defer alloc.free(summary_entry_ids);
@@ -520,12 +502,11 @@ fn prepareTranscriptSourceInternal(
                 .target_entry_id = tracked_entry_id,
                 .target_byte_entry_id = replaceable_entry_id,
                 .finality_entry_ids = finality_entry_ids,
-                .finality_entry_start_bytes = finality_entry_start_bytes,
+                .finality_entry_floor_bytes = finality_entry_floor_bytes,
                 .omitted_entry_id = omitted_entry_id,
                 .folded_summary_entry_ids = summary_entry_ids,
                 .capture_provenance = capture_provenance,
                 .entry_actions = entry_actions,
-                .maxxing_mode = self.maxxing_mode,
             },
             checkpoint,
         );
@@ -538,22 +519,28 @@ fn prepareTranscriptSourceInternal(
         var tool_turn_floors: std.ArrayList(transcript_release.ToolTurnFloor) = .empty;
         errdefer tool_turn_floors.deinit(alloc);
         for (finality_nominations.items, 0..) |nomination, index| {
-            const start_byte = finality_entry_start_bytes[index] orelse blk: {
-                // A nominated entry that produced no bytes cannot anchor the
-                // boundary; hold the whole flow rather than release past it.
+            const floor_byte = finality_entry_floor_bytes[index] orelse blk: {
+                // An empty assistant tail contributes no mutable rendered
+                // bytes, so the complete prepared flow is final. Other empty
+                // nominations remain conservative because their state may
+                // still mutate an earlier rendered entry.
+                const fallback = switch (nomination.kind) {
+                    .assistant_tail => bytes.len,
+                    .mutation_pin, .tool_turn => 0,
+                };
                 debug_trace.logf(
                     "scroll",
-                    "finality_nomination_unrecorded entry_id={d} kind={s}",
-                    .{ nomination.entry_id, @tagName(nomination.kind) },
+                    "finality_nomination_empty entry_id={d} kind={s} fallback={d}",
+                    .{ nomination.entry_id, @tagName(nomination.kind), fallback },
                 );
-                break :blk 0;
+                break :blk fallback;
             };
             switch (nomination.kind) {
-                .mutation_pin => finality.mutation_pin_start = start_byte,
-                .assistant_tail => finality.assistant_tail_start = start_byte,
+                .mutation_pin => finality.mutation_pin_start = floor_byte,
+                .assistant_tail => finality.assistant_tail_start = @min(bytes.len, floor_byte),
                 .tool_turn => try tool_turn_floors.append(alloc, .{
                     .turn_id = nomination.turn_id,
-                    .start_byte = start_byte,
+                    .start_byte = floor_byte,
                 }),
             }
         }
@@ -735,13 +722,13 @@ fn buildCommandOutputActions(
     return entry_actions;
 }
 
-fn buildMinimalTranscriptProjection(
+fn buildCompactTranscriptProjection(
     self: anytype,
     alloc: Allocator,
     command_overrides: *const CommandOutputOverrides,
     focused_entry_id: ?u32,
 ) !tool_group_projection.Projection {
-    return buildMinimalTranscriptProjectionInterruptible(
+    return buildCompactTranscriptProjectionInterruptible(
         self,
         alloc,
         command_overrides,
@@ -753,7 +740,7 @@ fn buildMinimalTranscriptProjection(
     };
 }
 
-fn buildMinimalTranscriptProjectionInterruptible(
+fn buildCompactTranscriptProjectionInterruptible(
     self: anytype,
     alloc: Allocator,
     command_overrides: *const CommandOutputOverrides,
@@ -767,7 +754,7 @@ fn buildMinimalTranscriptProjectionInterruptible(
         self.layout.cols,
         focused_entry_id,
         .{
-            .marker_style = user_message_card.minimalMarkerStyle(),
+            .marker_style = user_message_card.promptMarkerStyle(),
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
         },
@@ -1074,7 +1061,6 @@ test "minimal projection does not take ownership of command output overrides" {
         command_output_display: transcript_blocks.CommandOutputDisplayState = .{},
         layout: struct { cols: u16 = 80 } = .{},
         command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
-        maxxing_mode: @import("../../core/config/presentation_mode.zig").MaxxingMode = .minimal,
 
         fn deinit(self: *@This(), allocator: Allocator) void {
             for (self.command_output_blocks.items) |*block| block.deinit(allocator);

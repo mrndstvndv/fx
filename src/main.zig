@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.5";
+pub const version = "0.0.6";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -20,6 +20,7 @@ const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
+const input_submit_runtime = @import("core/app/input_submit_runtime.zig");
 const core_input_runtime = @import("core/input/runtime.zig");
 const input_queue_runtime = @import("core/app/input_queue_runtime.zig");
 const app_bootstrap_runtime = @import("core/app/app_bootstrap_runtime.zig");
@@ -51,13 +52,11 @@ const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
-const openai_codex_models = @import("gateway/openai_codex_models.zig");
-const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
-const xai_grok_models = @import("gateway/xai_grok_models.zig");
-const xai_grok_permission_reviewer = @import("gateway/xai_grok_permission_reviewer.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
+const provider_set = @import("core/gateway/provider_set.zig");
+const provider_catalog = @import("core/auth/provider_catalog.zig");
+const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
-const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
 const builtin_mcp = @import("builtins/mcp.zig");
@@ -84,7 +83,6 @@ const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
-const subagent_agent_adapter = @import("core/subagent/agent_adapter.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
@@ -118,8 +116,9 @@ const session_child_store = @import("core/session/session_child_store.zig");
 const session_log = @import("core/session/session_log.zig");
 const builtin_tools = @import("builtins/tools.zig");
 const browser_workspace_tools = @import("builtins/browser_workspace_tools.zig");
+const browser_capabilities = @import("core/hosts/browser_capabilities.zig");
 const tool_admission = @import("core/tooling/tool_admission.zig");
-const tool_advertisement = @import("core/tooling/tool_advertisement.zig");
+const tool_projection = @import("core/tooling/tool_projection.zig");
 const command_output_content = @import("core/tooling/command_output_content.zig");
 const tool_dispatch = @import("core/tooling/tool_dispatch.zig");
 const tool_set_contract = @import("core/tooling/tool_set.zig");
@@ -378,6 +377,7 @@ const App = struct {
     const HostConfigAppRuntime = app_host_config_runtime.Runtime(Self);
     const BootstrapAppRuntime = app_bootstrap_runtime.Runtime(Self);
     const InputAppRuntime = app_input_runtime.Runtime(Self);
+    const InputSubmitRuntime = input_submit_runtime.SubmitRuntime(Self);
     const NotificationAppRuntime = app_notification_runtime.Runtime(
         Self,
         builtin_hooks.notifications.provider(Self),
@@ -428,14 +428,16 @@ const App = struct {
             host.unavailable_url_opener;
     }
 
-    pub fn creditsProvider(_: *const Self) gateway_provider.CreditsProvider {
-        return builtin_gateway.credits_provider;
+    pub fn creditsProvider(self: *const Self) gateway_provider.CreditsProvider {
+        return self.providerSet()
+            .select(self.provider_selection.selection().provider)
+            .credits orelse gateway_provider.unavailable_credits_provider;
     }
 
     pub fn agentStreamProvider(self: *const Self) agent_stream_provider.Provider {
-        return self.subagentProviderRoutes()
+        return self.providerSet()
             .select(self.provider_selection.selection().provider)
-            .agent_stream_provider;
+            .agent_stream_or_unavailable();
     }
 
     pub fn fetchProviderCatalog(
@@ -443,7 +445,9 @@ const App = struct {
         provider: model_provider.ProviderId,
         access: credentials.CatalogAccess,
     ) !model_catalog.ProviderResult {
-        return builtin_providers.modelCatalog(provider).fetch(self.alloc, .{
+        const catalog = self.providerSet().select(provider).model_catalog orelse
+            return error.ModelCatalogUnavailable;
+        return catalog.fetch(self.alloc, .{
             .access = access,
             .endpoint = builtin_gateway.models_path,
             .cancel_flag = &self.worker.worker_cancel_requested,
@@ -505,7 +509,7 @@ const App = struct {
     agent_step_limit: usize = default_max_agent_steps,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{
-        .provider = if (host_profile.web_search) builtin_gateway.default_web_search_provider else null,
+        .provider = if (host_profile.web_search) builtin_providers.native.gateway.fx_search else null,
     }),
     web_search_models_path: []const u8 = builtin_gateway.models_path,
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
@@ -513,12 +517,12 @@ const App = struct {
     notifications: builtin_hooks.notifications.State = .{},
     herdr: builtin_hooks.Client = .{},
 
-    session: SessionRuntime = SessionRuntime.init(
+    session: SessionRuntime = SessionRuntime.initWithProviders(
         max_history_turns,
         if (host_profile.generation_usage)
-            builtin_gateway.generation_usage_provider
+            builtin_providers.native.deferredUsageProviders()
         else
-            generation_usage_provider.unavailable_provider,
+            .{},
     ),
     session_persistence: app_session_runtime.Persistence = .{},
     prompt_history: PromptHistoryRuntime = .{},
@@ -531,6 +535,7 @@ const App = struct {
     input_runtime: InputRuntime = .{},
     terminal_input_runtime: TerminalInputRuntime = .{},
     queued_prompt_review: input_queue_runtime.State = .{},
+    submission: input_submit_runtime.State = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     next_image_id: usize = 1,
     shell: TranscriptRuntime = .{},
@@ -819,6 +824,7 @@ const App = struct {
         };
         self.terminal_client.deinit();
         self.model_cache.deinit();
+        InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         const resume_handoff = if (capture_resume_handoff and
             direct_deinit_disposition == .settled)
             SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
@@ -1096,6 +1102,69 @@ const App = struct {
         return true;
     }
 
+    pub fn adoptPendingUserPrompt(
+        self: *App,
+        draft: *const worker_runtime.QueuedPromptDraft,
+    ) !void {
+        try self.writeUserPromptCardWithSkillBindings(
+            .{ .text = draft.prompt, .images = draft.images },
+            &.{},
+            draft.skill_display_spans,
+        );
+    }
+
+    pub fn finalizePendingSubmission(
+        self: *App,
+        draft: *const worker_runtime.QueuedPromptDraft,
+    ) !void {
+        const context_targets = if (self.context_enabled)
+            try context_contract.applicableTargetsForImages(self.alloc, draft.images)
+        else
+            &.{};
+        defer if (context_targets.len > 0) self.alloc.free(context_targets);
+        try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.session.setConversationLanguageFromUserMessage(draft.prompt);
+
+        const skill_tokens = try promptCardSkillTokensFromDisplaySpans(
+            self.alloc,
+            draft.skill_display_spans,
+        );
+        defer if (skill_tokens.len > 0) self.alloc.free(skill_tokens);
+        if (!try self.snapshotAndQueuePrompt(
+            draft.prompt,
+            skill_tokens,
+            null,
+            null,
+            draft.images,
+            draft.turn_id,
+            true,
+        )) return error.PendingPromptQueueRejected;
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+    }
+
+    pub fn notePendingFrameCommitted(self: *App) void {
+        InputSubmitRuntime.noteCommittedFrame(self);
+    }
+
+    pub fn acceptPresentedPrompt(self: *App, turn_id: u64) !void {
+        try InputSubmitRuntime.acceptPresentedPrompt(self, turn_id);
+    }
+
+    pub fn cancelPendingSubmission(self: *App) bool {
+        return InputSubmitRuntime.cancelPendingSubmission(self);
+    }
+
+    pub fn clearPendingSubmission(self: *App, reason: []const u8) void {
+        InputSubmitRuntime.clearPendingSubmission(self, reason);
+    }
+
+    pub fn clearPendingSubmissionForSessionTransition(self: *App) void {
+        InputSubmitRuntime.clearPendingSubmissionForSessionTransition(self);
+    }
+
     pub fn writeUserPromptCard(self: *App, user: types.UserTurn) !void {
         try self.writeUserPromptCardWithSpacing(user, self.session.historyLen() > 0);
     }
@@ -1228,6 +1297,9 @@ const App = struct {
             skill_tokens,
             review_draft,
             null,
+            null,
+            0,
+            false,
         );
     }
 
@@ -1244,6 +1316,9 @@ const App = struct {
             &.{},
             null,
             checkpoint,
+            null,
+            checkpoint.turn_id,
+            false,
         )) return false;
         WorkerAppRuntime.syncState(
             self,
@@ -1258,8 +1333,18 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
         review_draft: ?worker_runtime.QueueReviewDraft,
         recovery_checkpoint: ?*const session_codec.RecoveryCheckpoint,
+        prompt_images: ?[]const types.ImageAttachment,
+        turn_id: u64,
+        user_prompt_already_presented: bool,
     ) !bool {
         try self.reloadSkills();
+
+        const source_images = if (recovery_checkpoint) |checkpoint|
+            checkpoint.user.images
+        else if (prompt_images) |images|
+            images
+        else
+            self.pending_images.items;
 
         const prompt_copy = try std.heap.c_allocator.dupe(u8, prompt);
         errdefer std.heap.c_allocator.free(prompt_copy);
@@ -1284,10 +1369,7 @@ const App = struct {
 
         const authorized_image_catalog = try self.session.snapshotImageCatalog(
             std.heap.c_allocator,
-            if (recovery_checkpoint) |checkpoint|
-                checkpoint.user.images
-            else
-                self.pending_images.items,
+            source_images,
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, authorized_image_catalog);
 
@@ -1302,10 +1384,7 @@ const App = struct {
 
         const images_copy = try types.dupeImageAttachmentSlice(
             std.heap.c_allocator,
-            if (recovery_checkpoint) |checkpoint|
-                checkpoint.user.images
-            else
-                self.pending_images.items,
+            source_images,
         );
         errdefer types.freeImageAttachmentSlice(std.heap.c_allocator, images_copy);
 
@@ -1345,7 +1424,7 @@ const App = struct {
             );
 
         try self.worker.enqueuePrompt(std.heap.c_allocator, .{
-            .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else 0,
+            .turn_id = if (recovery_checkpoint) |checkpoint| checkpoint.turn_id else turn_id,
             .prompt = prompt_copy,
             .images = images_copy,
             .authorized_image_catalog = authorized_image_catalog,
@@ -1365,6 +1444,7 @@ const App = struct {
             .context_snapshot = context_snapshot_copy,
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
+            .user_prompt_already_presented = user_prompt_already_presented,
         });
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -1411,6 +1491,30 @@ const App = struct {
             self.toolRegistry(),
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         );
+    }
+
+    pub fn startMcpAuthentication(
+        self: *App,
+        server_name: []const u8,
+    ) !mcp_command_provider.AuthenticationStart {
+        return self.mcp.startAuthentication(
+            self.alloc,
+            server_name,
+            self.urlOpener(),
+        );
+    }
+
+    pub fn takeMcpAuthenticationCompletion(
+        self: *App,
+    ) !?app_mcp_runtime.AuthenticationCompletion {
+        return self.mcp.takeAuthenticationCompletion();
+    }
+
+    pub fn mcpAuthenticationPending(
+        self: *App,
+        server_name: []const u8,
+    ) bool {
+        return self.mcp.authenticationPending(server_name);
     }
 
     pub fn takeMcpReloadCompletion(self: *App) !?app_mcp_runtime.ReloadCompletion {
@@ -1464,7 +1568,7 @@ const App = struct {
         return self.mcp.callTool(arena, name, arguments_json, max_tool_result_bytes, options);
     }
 
-    pub fn searchMcpTools(self: *App, arena: Allocator, query: []const u8, limit: usize, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
+    pub fn searchMcpTools(self: *App, arena: Allocator, query: *const tool_mcp_runtime.PreparedQuery, limit: usize, permission_rules: types.PermissionRuleSet, access: tool_mcp_runtime.Access) !tool_mcp_runtime.SearchResult {
         return self.mcp.searchTools(arena, query, limit, permission_rules, self.context_limits, access);
     }
 
@@ -1501,40 +1605,40 @@ const App = struct {
         );
     }
 
-    pub fn snapshotGatewayToolProjection(
+    pub fn snapshotModelToolProjection(
         self: *App,
         alloc: Allocator,
         permission_mode: types.PermissionMode,
-    ) !tool_advertisement.EffectiveToolProjection {
+    ) !tool_projection.EffectiveToolProjection {
         self.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
         defer self.permission_state.authority_mutex.unlock(io_mod.getIo());
-        return self.snapshotGatewayToolProjectionForRules(
+        return self.snapshotModelToolProjectionForRules(
             alloc,
             permission_mode,
             self.permission_engine.rules,
         );
     }
 
-    pub fn snapshotSubagentGatewayToolProjection(
+    pub fn snapshotSubagentModelToolProjection(
         self: *App,
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
-    ) !tool_advertisement.EffectiveToolProjection {
-        return self.snapshotGatewayToolProjectionForRules(
+    ) !tool_projection.EffectiveToolProjection {
+        return self.snapshotModelToolProjectionForRules(
             alloc,
             permission_mode,
             permission_rules,
         );
     }
 
-    fn snapshotGatewayToolProjectionForRules(
+    fn snapshotModelToolProjectionForRules(
         self: *App,
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
-    ) !tool_advertisement.EffectiveToolProjection {
-        return app_mcp_runtime.buildGatewayToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
+    ) !tool_projection.EffectiveToolProjection {
+        return app_mcp_runtime.buildModelToolProjection(&self.mcp, alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
@@ -1571,44 +1675,35 @@ const App = struct {
     }
 
     pub fn permissionReviewerProvider(self: *const App) ?permission_auto_classifier.Provider {
-        return self.subagentProviderRoutes()
+        return self.providerSet()
             .select(self.provider_selection.selection().provider)
-            .permission_reviewer_provider;
+            .permission_reviewer;
     }
 
-    pub fn subagentProviderRoutes(_: *const App) subagent_agent_adapter.ProviderRoutes {
-        return .{
-            .gateway = .{
-                .agent_stream_provider = if (comptime host_target.is_wasm)
-                    js_host_stream_provider.provider()
-                else
-                    builtin_providers.agentStream(.gateway),
-                .permission_reviewer_provider = if (comptime host_profile.tools)
+    pub fn providerSet(_: *const App) provider_set.Set {
+        if (comptime host_target.is_wasm) {
+            return provider_set.gateway_only(.{
+                .capabilities = .{
+                    .vision_fallback = host_profile.tools,
+                },
+                .presentation = provider_catalog.find(.gateway),
+                .auth_strategy = .vercel,
+                .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
+                .agent_stream = js_host_stream_provider.provider(),
+                .model_catalog = js_host_model_catalog.provider,
+                .permission_reviewer = if (comptime host_profile.tools)
                     builtin_gateway.permission_reviewer.provider
                 else
                     null,
-            },
-            .codex = .{
-                .agent_stream_provider = if (comptime host_target.is_wasm)
-                    agent_stream_provider.unavailable_provider
-                else
-                    builtin_providers.agentStream(.codex),
-                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
-                    openai_codex_permission_reviewer.provider
-                else
-                    null,
-            },
-            .grok = .{
-                .agent_stream_provider = if (comptime host_target.is_wasm)
-                    agent_stream_provider.unavailable_provider
-                else
-                    builtin_providers.agentStream(.grok),
-                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
-                    xai_grok_permission_reviewer.provider
-                else
-                    null,
-            },
-        };
+            });
+        }
+        var providers = builtin_providers.native;
+        if (comptime !host_profile.tools) {
+            providers.gateway.permission_reviewer = null;
+            providers.codex.permission_reviewer = null;
+            providers.grok.permission_reviewer = null;
+        }
+        return providers;
     }
 
     pub fn describeToolAction(self: *App, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) ![]const u8 {
@@ -1718,7 +1813,7 @@ const App = struct {
             if (comptime host_target.is_wasm)
                 js_host_model_catalog.provider
             else
-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
             builtin_gateway.models_path,
         );
     }
@@ -1735,7 +1830,7 @@ const App = struct {
             );
         } else {
             self.model_cache.startWarmup(
-                builtin_providers.modelCatalog(self.provider_selection.selection().provider),
+                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse unreachable,
                 self.auth.modelCatalogAccess(),
             );
         }
@@ -1758,11 +1853,16 @@ const App = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *App, model: []const u8) model_capabilities.Capabilities {
-        return model_capabilities.resolveCapabilities(model, self.model_cache.metadataForModel(model));
+        const bundle = self.providerSet().select(self.provider_selection.selection().provider);
+        return model_capabilities.mergeCapabilities(
+            bundle.fallbackModelCapabilities(model),
+            self.model_cache.metadataForModel(model),
+        );
     }
 
     pub fn resolveModelCapabilitiesForRequest(self: *App, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
-        return self.model_cache.resolveForRequest(model, &self.worker.worker_cancel_requested);
+        _ = try self.model_cache.resolveForRequest(model, &self.worker.worker_cancel_requested);
+        return self.resolvedModelCapabilities(model);
     }
 
     /// Must be called after init() returns so the loader thread captures
@@ -1887,6 +1987,12 @@ const App = struct {
 
     pub fn appendStaticContextMessage(self: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
         try AgentAppRuntime.appendStaticContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+        if (comptime host_target.is_wasm) {
+            try messages.append(arena, .{
+                .role = .system,
+                .content = browser_capabilities.model_context,
+            });
+        }
     }
 
     fn runtimeContextSnapshot(self: *App, alloc: Allocator) !RuntimeContextSnapshot {
@@ -2473,6 +2579,7 @@ const App = struct {
     pub fn loopCollectFacts(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
+        InputSubmitRuntime.collectPendingSubmissionFacts(self);
 
         if (!self.terminal_takeover.blocksFxSurface(&self.terminal)) {
             try self.collectThemeFacts();
@@ -2496,6 +2603,7 @@ const App = struct {
         if (try self.model_cache.pollLoadTransition()) {
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
+        try app_commands.Handlers(App).collectMcpAuthenticationFacts(self);
         try app_commands.Handlers(App).collectMcpReloadFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectSignInFacts(self);
@@ -3235,12 +3343,7 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
-        .codex_agent_stream = builtin_providers.agentStream(.codex),
-        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
-        .codex_model_catalog = openai_codex_models.model_catalog_provider,
-        .grok_agent_stream = builtin_providers.agentStream(.grok),
-        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
-        .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .provider_set = builtin_providers.native,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3260,9 +3363,6 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
-        .permission_reviewer_provider = builtin_gateway.permission_reviewer.provider,
-        .codex_permission_reviewer_provider = openai_codex_permission_reviewer.provider,
-        .grok_permission_reviewer_provider = xai_grok_permission_reviewer.provider,
     };
 }
 
@@ -3278,12 +3378,7 @@ fn localEntryConfig() app_entry_runtime.Config {
         .gateway_retry_count = builtin_gateway.retry_count,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_provider = native_gateway_provider,
-        .codex_agent_stream = builtin_providers.agentStream(.codex),
-        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
-        .codex_model_catalog = openai_codex_models.model_catalog_provider,
-        .grok_agent_stream = builtin_providers.agentStream(.grok),
-        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
-        .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .provider_set = builtin_providers.native,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3318,12 +3413,7 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .gateway_retry_count = 0,
         .gateway_chat_url = "",
         .gateway_provider = native_gateway_provider,
-        .codex_agent_stream = builtin_providers.agentStream(.codex),
-        .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
-        .codex_model_catalog = openai_codex_models.model_catalog_provider,
-        .grok_agent_stream = builtin_providers.agentStream(.grok),
-        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
-        .grok_model_catalog = xai_grok_models.model_catalog_provider,
+        .provider_set = builtin_providers.native,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3812,7 +3902,6 @@ test {
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
-    _ = @import("ui/footer/appearance_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("ui/settings_screen.zig");
@@ -3837,7 +3926,8 @@ test {
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
     _ = @import("core/workspace/file_index.zig");
-    _ = @import("core/gateway/gateway_json.zig");
+    _ = @import("gateway/vercel_protocol.zig");
+    _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/github/git_context.zig");
     _ = @import("core/github/github_publish.zig");
     _ = @import("core/github/github_workflows.zig");
@@ -3864,6 +3954,7 @@ test {
     _ = @import("core/config/model_capabilities.zig");
     _ = @import("core/output/output_contracts.zig");
     _ = @import("core/workspace/pathing.zig");
+    _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
     _ = @import("core/background/process_supervisor.zig");
@@ -3915,7 +4006,7 @@ test {
     _ = @import("acp/sessions.zig");
     _ = @import("core/tasks/task_helpers.zig");
     _ = @import("core/shared/text_utils.zig");
-    _ = @import("core/tooling/tool_advertisement.zig");
+    _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
     _ = @import("core/hosts/js_host_workspace.zig");
@@ -3927,6 +4018,7 @@ test {
     _ = @import("builtins/mcp.zig");
     _ = @import("builtins/modes.zig");
     _ = @import("builtins/tools.zig");
+    _ = @import("tools/agent/ask_user_question.zig");
     _ = @import("builtins/browser_workspace_tools.zig");
     _ = @import("core/tooling/model_request_budget.zig");
     _ = @import("core/tooling/web_fetch_runtime.zig");
@@ -3938,6 +4030,7 @@ test {
     _ = @import("tools/web/html_to_markdown.zig");
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/filesystem/semantic_search.zig");
+    _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("core/upgrade/upgrade_helpers.zig");

@@ -20,7 +20,6 @@ const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
-const presentation_mode = @import("../../core/config/presentation_mode.zig");
 const ui_render = @import("../render.zig");
 const render_engine = @import("../render_engine.zig");
 const render_request = @import("../render_request.zig");
@@ -129,23 +128,6 @@ pub const SettingsMenuProjection = struct {
         return settings_catalog.itemAt(self.snapshot, self.category, self.query, display_index);
     }
 };
-
-pub const AppearanceMenuProjection = struct {
-    active: bool = false,
-    selected_index: usize = 0,
-    snapshot: settings_catalog.Snapshot = .{},
-};
-
-pub fn appearanceMenuProjection(
-    menu: *const settings_catalog.AppearanceMenu,
-    snapshot: settings_catalog.Snapshot,
-) AppearanceMenuProjection {
-    return .{
-        .active = menu.active,
-        .selected_index = menu.selected_index,
-        .snapshot = snapshot,
-    };
-}
 
 pub const StatuslineMenuProjection = struct {
     active: bool = false,
@@ -271,12 +253,8 @@ pub fn modelMenuProjection(cache: *const model_cache_runtime.Runtime) ModelMenuP
 
 const max_static_status_activity_rows: u16 = 3;
 
-pub const InputAppearance = core_input_runtime.InputAppearance;
-pub const MaxxingMode = presentation_mode.MaxxingMode;
-
 pub const QueuedPromptCard = struct {
     bytes: []const u8,
-    row_count: u16,
     editing: bool = false,
 };
 
@@ -290,8 +268,6 @@ pub const RenderContext = struct {
     model: []const u8,
     pending_images: []const types.ImageAttachment = &.{},
     composer_visible: bool = true,
-    input_appearance: InputAppearance = .lines,
-    maxxing_mode: MaxxingMode = .legacy,
     permission_mode: types.PermissionMode = .ask,
     queued_count: usize,
     queued_paused: bool = false,
@@ -339,7 +315,6 @@ pub const RenderContext = struct {
     skills_menu: SkillsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
-    appearance_menu: AppearanceMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
@@ -381,20 +356,59 @@ pub fn queuedCardSpacerRows(ctx: RenderContext) u16 {
     return 1 +| above_hint;
 }
 
-pub fn queuedBannerRows(ctx: RenderContext) u16 {
-    if (ctx.queued_count == 0) return 0;
-    const paused_hint_rows: u16 = @intFromBool(ctx.queued_paused);
-    if (ctx.queued_prompt_card_rows > 0) {
-        return queuedCardContentRows(ctx) +|
-            paused_hint_rows +|
-            queuedCardSpacerRows(ctx);
+pub const QueuedBannerFacts = struct {
+    queued_count: usize = 0,
+    paused: bool = false,
+    card_count: usize = 0,
+    card_rows: u16 = 0,
+};
+
+pub fn queuedBannerRowsForFacts(facts: QueuedBannerFacts) u16 {
+    if (facts.queued_count == 0) return 0;
+    const paused_hint_rows: u16 = @intFromBool(facts.paused);
+    if (facts.card_rows > 0) {
+        const between_cards: u16 = @intCast(@min(
+            facts.card_count -| 1,
+            std.math.maxInt(u16),
+        ));
+        const spacer_rows: u16 = 1 +| paused_hint_rows;
+        return facts.card_rows +| between_cards +| paused_hint_rows +| spacer_rows;
     }
-    // No cards means the banner is collapsed to its single summary row.
     return 1 +| paused_hint_rows +| collapsed_queue_banner_gap_rows;
 }
 
+pub fn queuedBannerRows(ctx: RenderContext) u16 {
+    return queuedBannerRowsForFacts(.{
+        .queued_count = ctx.queued_count,
+        .paused = ctx.queued_paused,
+        .card_count = ctx.queued_prompt_cards.len,
+        .card_rows = ctx.queued_prompt_card_rows,
+    });
+}
+
+test "queued banner row policy consumes aggregate card facts" {
+    try std.testing.expectEqual(@as(u16, 2), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+    }));
+    try std.testing.expectEqual(@as(u16, 3), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .paused = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 7), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .card_count = 2,
+        .card_rows = 5,
+    }));
+    try std.testing.expectEqual(@as(u16, 9), queuedBannerRowsForFacts(.{
+        .queued_count = 2,
+        .paused = true,
+        .card_count = 2,
+        .card_rows = 5,
+    }));
+}
+
 pub fn transientActivityGapRows(shell: *const TranscriptRuntime, tool_before_activity: bool) u16 {
-    if (tool_before_activity and shell.maxxing_mode == .minimal) return 0;
+    if (tool_before_activity) return 0;
     return shell.transientAssistantGapRows();
 }
 
@@ -768,11 +782,11 @@ test "frame-owned activity keeps active tools out of the turn status row" {
     }
 }
 
-test "minimal frame-owned activity leaves the focused tool in the transcript" {
+test "current frame-owned activity leaves the focused tool in the transcript" {
     var input = InputRuntime{};
     defer input.deinit(std.testing.allocator);
 
-    var shell = TranscriptRuntime{ .maxxing_mode = .minimal };
+    var shell = TranscriptRuntime{};
     defer shell.deinit(std.testing.allocator);
     const ctx: RenderContext = .{
         .stream = .{
